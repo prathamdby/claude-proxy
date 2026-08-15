@@ -89,8 +89,10 @@ const config = (() => {
   readText("HOST", "a bind address with no spaces, such as 127.0.0.1 or 0.0.0.0", { pattern: /^\S+$/ });
   readInteger("PORT", "an integer between 1 and 65535", { min: 1, max: 65535 });
   readUrl("ANYROUTER_BASE_URL", "an absolute http:// or https:// URL");
-  readText("ANYROUTER_API_KEY", "the upstream gateway key, at least 8 characters", { minLength: 8, secret: true, pattern: headerValue });
-  readText("LOCAL_PROXY_KEY", "a shared secret of at least 16 characters (generate one with: openssl rand -hex 32)", { minLength: 16, secret: true, pattern: headerValue });
+  readText("ANYROUTER_API_KEY", "the upstream gateway key", { secret: true, pattern: headerValue });
+  // No length floor: this gate only guards a loopback-bound port, so a short
+  // placeholder like sk-dummy is a legitimate choice.
+  readText("LOCAL_PROXY_KEY", "the shared secret Claude Code sends back, such as sk-dummy", { secret: true, pattern: headerValue });
   readText("CLAUDE_CODE_VERSION", "a version string such as 2.1.197", { pattern: headerValue });
   readText("ANYROUTER_MODEL", "a model id such as claude-opus-4-8");
   readInteger("UPSTREAM_TIMEOUT_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });

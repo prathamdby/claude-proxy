@@ -42,8 +42,8 @@ before building anything.
 
 ```sh
 cp .env.example .env
-# edit .env: set ANYROUTER_API_KEY, and generate LOCAL_PROXY_KEY with:
-#   openssl rand -hex 32
+# edit .env: set ANYROUTER_API_KEY to your gateway key.
+# LOCAL_PROXY_KEY defaults to sk-dummy, which is fine for loopback-only use.
 docker compose up -d
 ```
 
@@ -85,7 +85,7 @@ Do not quote them — Compose treats quotes in an env file as part of the value.
 | `PORT` | Port inside the container. Keep ≥1024; it runs as a non-root user. | `18989` (1–65535) |
 | `ANYROUTER_BASE_URL` | Gateway every request is forwarded to. `http:`/`https:` only. | `https://anyrouter.top` |
 | `ANYROUTER_API_KEY` | Gateway credential, sent as `Authorization: Bearer`. Bills to your account. | ≥8 chars |
-| `LOCAL_PROXY_KEY` | Secret Claude Code must present to this proxy. | ≥16 chars, `openssl rand -hex 32` |
+| `LOCAL_PROXY_KEY` | Secret Claude Code must present to this proxy. | `sk-dummy` |
 | `CLAUDE_CODE_VERSION` | Version in the synthesized `User-Agent`. | `2.1.197` |
 | `ANYROUTER_MODEL` | Model used when a request omits `model`. | `claude-opus-4-8` |
 | `ANYROUTER_WIRE_OS` | `x-stainless-os` header value. | `MacOS` |

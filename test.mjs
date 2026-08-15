@@ -578,18 +578,20 @@ try {
   assert.equal(missingVars.stdout, "");
 
   // Present but unusable fails the same way, and a rejected secret is never
-  // echoed back into stderr.
+  // echoed back into stderr. There is no length floor on LOCAL_PROXY_KEY --
+  // sk-dummy is a supported choice -- so this uses a newline, which is rejected
+  // because the value ends up in an HTTP header.
   const invalidVars = await runProxyToExit({
     ...proxyEnv,
     PORT: "abc",
     PROXY_TRACE: "1",
-    LOCAL_PROXY_KEY: "too-short"
+    LOCAL_PROXY_KEY: "leaky\nsecret"
   });
   assert.notEqual(invalidVars.code, 0);
   assert.match(invalidVars.stderr, /PORT: expected an integer between 1 and 65535, got "abc"/);
   assert.match(invalidVars.stderr, /PROXY_TRACE: expected exactly "true" or "false"/);
   assert.match(invalidVars.stderr, /LOCAL_PROXY_KEY/);
-  assert.doesNotMatch(invalidVars.stderr, /too-short/);
+  assert.doesNotMatch(invalidVars.stderr, /leaky/);
 
   console.log(`All Any Router Local Proxy v2.1.0 tests passed (${captured.length} upstream requests).`);
 } finally {
