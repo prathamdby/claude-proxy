@@ -1,4 +1,4 @@
-# Any Router Local Proxy -- Docker Compose deployment.
+# Local API Proxy -- Docker Compose deployment.
 #
 # No top-level `version:` key: it is obsolete in Compose v2+ and now warns.
 #
@@ -19,14 +19,14 @@
 # string with only a warning, and an empty PORT would otherwise become 0 and
 # bind a random port.
 
-name: agentrouter-local-proxy
+name: local-api-proxy
 
 services:
   proxy:
     build:
       context: .
       dockerfile: Dockerfile
-    image: agentrouter-local-proxy:2.1.0
+    image: local-api-proxy:3.0.0
 
     restart: unless-stopped
 
@@ -60,17 +60,14 @@ services:
 
       # Everything else is passed through and must be present in .env.
       PORT: "${PORT:?missing in .env - see .env.example}"
-      ANYROUTER_BASE_URL: "${ANYROUTER_BASE_URL:?missing in .env - see .env.example}"
-      ANYROUTER_API_KEY: "${ANYROUTER_API_KEY:?missing in .env - see .env.example}"
+      UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:?missing in .env - see .env.example}"
+      UPSTREAM_API_KEY: "${UPSTREAM_API_KEY:?missing in .env - see .env.example}"
       LOCAL_PROXY_KEY: "${LOCAL_PROXY_KEY:?missing in .env - see .env.example}"
       CLAUDE_CODE_VERSION: "${CLAUDE_CODE_VERSION:?missing in .env - see .env.example}"
-      ANYROUTER_MODEL: "${ANYROUTER_MODEL:?missing in .env - see .env.example}"
+      UPSTREAM_MODEL: "${UPSTREAM_MODEL:?missing in .env - see .env.example}"
       UPSTREAM_TIMEOUT_MS: "${UPSTREAM_TIMEOUT_MS:?missing in .env - see .env.example}"
       RETRY_AFTER_SECONDS: "${RETRY_AFTER_SECONDS:?missing in .env - see .env.example}"
       MAX_BODY_BYTES: "${MAX_BODY_BYTES:?missing in .env - see .env.example}"
-      ANYROUTER_WIRE_OS: "${ANYROUTER_WIRE_OS:?missing in .env - see .env.example}"
-      ANYROUTER_WIRE_ARCH: "${ANYROUTER_WIRE_ARCH:?missing in .env - see .env.example}"
-      ANYROUTER_STAINLESS_VERSION: "${ANYROUTER_STAINLESS_VERSION:?missing in .env - see .env.example}"
       RESPONSES_STORE_MAX: "${RESPONSES_STORE_MAX:?missing in .env - see .env.example}"
       PROXY_LOG: "${PROXY_LOG:?missing in .env - see .env.example}"
       PROXY_LOG_VERBOSE: "${PROXY_LOG_VERBOSE:?missing in .env - see .env.example}"
@@ -109,7 +106,7 @@ services:
       #
       # This is a liveness probe only. `ok` is hardcoded true and the handler
       # never contacts the gateway, so a healthy container proves the event
-      # loop responds -- NOT that Any Router is reachable or the key is valid.
+      # loop responds -- NOT that the gateway is reachable or the key is valid.
       test:
         - CMD
         - node
@@ -132,7 +129,7 @@ services:
     # Deliberately a tmpfs and not a volume: the trace contains full prompts
     # and completions, so it is capped at 64 MiB and dies with the container
     # instead of accumulating on the host. Read a live trace with
-    #   docker compose exec proxy cat /tmp/anyrouter-trace.log
+    #   docker compose exec proxy cat /tmp/proxy-trace.log
     tmpfs:
       - /tmp:size=64m,mode=1777
 
