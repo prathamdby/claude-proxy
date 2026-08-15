@@ -19,6 +19,19 @@ const captured = [];
 const lingeringResponses = [];
 const preservedSession = "123e4567-e89b-42d3-a456-426614174000";
 
+// The gateway's model catalogue. Both ids are unlike anything else the suite
+// sends, and neither is UPSTREAM_MODEL, so an assertion that the proxy returned
+// this list cannot pass on a list the proxy invented from its own config.
+const upstreamModelCatalogue = {
+  data: [
+    { type: "model", id: "gateway-alpha", display_name: "Gateway Alpha", created_at: "2026-01-09T00:00:00Z" },
+    { type: "model", id: "gateway-beta", display_name: "Gateway Beta", created_at: "2026-02-17T00:00:00Z" }
+  ],
+  has_more: false,
+  first_id: "gateway-alpha",
+  last_id: "gateway-beta"
+};
+
 function listen(server) {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve(server.address().port));
@@ -96,7 +109,7 @@ const upstream = http.createServer((req, res) => {
   req.on("end", () => {
     let payload = {};
     try { payload = body ? JSON.parse(body) : {}; } catch {}
-    captured.push({ url: req.url, headers: req.headers, body, payload });
+    captured.push({ method: req.method, url: req.url, headers: req.headers, body, payload });
 
     if (req.url.startsWith("/v1/messages/count_tokens")) {
       res.writeHead(200, { "content-type": "application/json" });
@@ -160,6 +173,12 @@ const upstream = http.createServer((req, res) => {
         return;
       }
       writeOpenAiStream(res);
+      return;
+    }
+
+    if (req.url.startsWith("/v1/models")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(upstreamModelCatalogue));
       return;
     }
 
@@ -338,26 +357,64 @@ try {
 
   // Local API auth is enforced, and it runs before routing: an unauthenticated
   // call to a path the proxy does not serve is still 401, not 404.
-  const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/models`);
+  const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/unserved`);
   assert.equal(rejected.status, 401);
   const rejectedBody = await rejected.json();
   assert.equal(rejectedBody.type, "error");
 
-  // The proxy cannot know which models the gateway carries, so it never invents
-  // a catalogue: /v1/models is an ordinary 404. The 404 text is generated from
-  // the route table, so it can only ever name paths that are actually served.
-  const modelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/v1/models`, {
+  // /v1/models is forwarded to the gateway and its answer is returned byte for
+  // byte. The catalogue is the gateway's -- these ids exist nowhere in the
+  // proxy's configuration, so a list assembled locally could not produce them.
+  const modelsIndex = captured.length;
+  const modelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?limit=2&after_id=gateway-zero`, {
     headers: { authorization: `Bearer ${localKey}` }
   });
-  assert.equal(modelsResponse.status, 404);
-  const modelsBody = await modelsResponse.json();
-  assert.equal(modelsBody.error.type, "not_found");
-  assert.doesNotMatch(modelsBody.error.message, /v1\/models/);
-  for (const path of ["/v1/messages", "/v1/messages/count_tokens", "/v1/chat/completions", "/v1/responses"]) {
-    assert.ok(modelsBody.error.message.includes(`POST ${path}`), `404 text must name ${path}`);
+  assert.equal(modelsResponse.status, 200);
+  assert.match(modelsResponse.headers.get("content-type"), /application\/json/);
+  assert.equal(await modelsResponse.text(), JSON.stringify(upstreamModelCatalogue));
+
+  // It reaches upstream as the GET it was, with no body invented for it, and
+  // carrying the pagination the client asked for. beta=true is not bolted on:
+  // that parameter belongs to /v1/messages and nothing else.
+  const modelsRequest = captured[modelsIndex];
+  assert.equal(modelsRequest.method, "GET");
+  assert.equal(modelsRequest.url, "/v1/models?limit=2&after_id=gateway-zero");
+  assert.equal(modelsRequest.body, "");
+
+  // The credential swap is not something the messages routes do on their own:
+  // it happens for every forwarded request, including this one.
+  assert.equal(modelsRequest.headers.authorization, `Bearer ${testApiKey}`);
+  assert.notEqual(modelsRequest.headers.authorization, `Bearer ${localKey}`);
+  assert.equal(modelsRequest.headers["x-api-key"], undefined);
+
+  // Each path answers to exactly one method, so /v1/models by POST is refused
+  // the same way a path that is not served at all is -- one status, one body,
+  // nothing that tells a prober which half of the pair they guessed right.
+  const modelsByPost = await post("/v1/models", {});
+  assert.equal(modelsByPost.status, 404);
+  const notFoundText = await modelsByPost.text();
+  const messagesByGet = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    headers: { authorization: `Bearer ${localKey}` }
+  });
+  assert.equal(messagesByGet.status, 404);
+  assert.equal(await messagesByGet.text(), notFoundText);
+
+  // The 404 text is generated from the route table, so it can only ever name
+  // routes that are really served -- method included.
+  const notFoundBody = JSON.parse(notFoundText);
+  assert.equal(notFoundBody.error.type, "not_found");
+  for (const route of [
+    "POST /v1/messages",
+    "POST /v1/messages/count_tokens",
+    "POST /v1/chat/completions",
+    "POST /v1/responses",
+    "GET /v1/models"
+  ]) {
+    assert.ok(notFoundBody.error.message.includes(route), `404 text must name ${route}`);
   }
 
   // Streaming + SSE sanitation + beta merge + session preservation.
+  const streamedIndex = captured.length;
   const streamedAnthropic = await post("/v1/messages", {
     model: "claude-opus-4-8",
     max_tokens: 8,
@@ -839,7 +896,7 @@ try {
   assert.equal(healthResponse.status, 200);
   assert.deepEqual(Object.keys(health).sort(), ["node", "ok", "stats", "upstream", "uptime_seconds", "version"]);
   assert.equal(health.ok, true);
-  assert.equal(health.version, "4.0.0");
+  assert.equal(health.version, "4.1.0");
   assert.equal(health.node, process.version);
   assert.equal(health.upstream, `http://127.0.0.1:${upstreamPort}`);
   assert.ok(health.stats.normalizedTo429 >= 2);
@@ -855,8 +912,10 @@ try {
   // missing one would mean a rejection was answered without being recorded.
   assert.equal(health.stats.hostRejected, hostRejectionsCaused);
 
-  // Inspect actual upstream wire image.
-  const first = captured[0];
+  // Inspect actual upstream wire image: the streamed /v1/messages call above,
+  // found by the index taken just before it was made rather than by assuming it
+  // is the first request the gateway ever saw.
+  const first = captured[streamedIndex];
 
   // The proxy owns auth: the local key never reaches the upstream in any form.
   assert.equal(first.headers.authorization, `Bearer ${testApiKey}`);

@@ -26,7 +26,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local-api-proxy:4.0.0
+    image: local-api-proxy:4.1.0
 
     restart: unless-stopped
 
