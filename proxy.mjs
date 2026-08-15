@@ -86,13 +86,54 @@ const config = (() => {
     values[name] = parsed;
   };
 
+  // The operator fills this in by copying the host out of the ANTHROPIC_BASE_URL
+  // they point Claude Code at, so every form that URL can take is accepted: a
+  // bare hostname, host:port, a full URL, and an IPv6 literal with or without
+  // brackets. Each entry is reduced to its hostname here — the scheme and port
+  // are dropped because only the hostname is ever matched — so the comparison at
+  // request time is a plain string equality against an already-normalised list.
+  const readHostList = (name, expected) => {
+    const value = read(name);
+    if (!value) return invalid(name, expected, value);
+    const hostnames = [];
+    for (const entry of value.split(",")) {
+      const item = entry.trim();
+      if (!item) return invalid(name, expected, value);
+      let parsed = null;
+      try {
+        parsed = item.includes("://") ? new URL(item) : new URL(`http://${item}`);
+      } catch {
+        // A bare IPv6 literal is only a legal authority once bracketed, so ::1
+        // is retried as [::1] rather than reported as a typo.
+        try {
+          parsed = new URL(`http://[${item}]`);
+        } catch {
+          parsed = null;
+        }
+      }
+      if (!parsed?.hostname) return invalid(name, expected, value);
+      hostnames.push(parsed.hostname.toLowerCase());
+    }
+    values[name] = Object.freeze(hostnames);
+  };
+
   readText("HOST", "a bind address with no spaces, such as 127.0.0.1 or 0.0.0.0", { pattern: /^\S+$/ });
   readInteger("PORT", "an integer between 1 and 65535", { min: 1, max: 65535 });
+  readInteger("HEALTH_PORT", "an integer between 1 and 65535", { min: 1, max: 65535 });
+  readHostList(
+    "ALLOWED_HOSTS",
+    "a comma-separated list of hosts this proxy answers to, such as 127.0.0.1,claude-proxy.203.0.113.10.nip.io"
+  );
   readUrl("UPSTREAM_BASE_URL", "an absolute http:// or https:// URL");
-  readText("UPSTREAM_API_KEY", "the upstream gateway key", { secret: true, pattern: headerValue });
-  // No length floor: this gate only guards a loopback-bound port, so a short
-  // placeholder like sk-dummy is a legitimate choice.
-  readText("LOCAL_PROXY_KEY", "the shared secret Claude Code sends back, such as sk-dummy", { secret: true, pattern: headerValue });
+  readText("UPSTREAM_API_KEY", "at least 8 characters of upstream gateway key", { minLength: 8, secret: true, pattern: headerValue });
+  // This key is the only thing standing between the public internet and a paid
+  // upstream credential, so it has to be generated rather than chosen: a short
+  // placeholder is a giveaway once the port is reachable from anywhere.
+  readText(
+    "LOCAL_PROXY_KEY",
+    "at least 32 characters of shared secret for Claude Code to send back; generate one with: openssl rand -base64 32",
+    { minLength: 32, secret: true, pattern: headerValue }
+  );
   readText("CLAUDE_CODE_VERSION", "a version string such as 2.1.197", { pattern: headerValue });
   readText("UPSTREAM_MODEL", "a model id such as claude-opus-4-8");
   readInteger("UPSTREAM_TIMEOUT_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });
@@ -105,6 +146,20 @@ const config = (() => {
   readText("PROXY_TRACE_FILE", "a file path for the request trace, such as /tmp/proxy-trace.log");
   readBoolean("PROXY_TRACE", "the verbatim request and response file trace");
   readInteger("PROXY_TRACE_BODY_LIMIT", "an integer of at least 0 (characters; 0 means no truncation)", { min: 0 });
+
+  // Relationships between variables, checked only once both sides actually
+  // validated: an unset variable leaves `values[name]` undefined, so comparing
+  // unconditionally would report the two ports (or the two keys) as identical
+  // whenever neither is set, burying the two real "not set" problems under a
+  // third that says something untrue.
+  if (values.PORT !== undefined && values.HEALTH_PORT !== undefined && values.PORT === values.HEALTH_PORT) {
+    problems.push(`HEALTH_PORT: expected a port of its own, but it is ${values.HEALTH_PORT}, the same port as PORT`);
+  }
+  // The whole point of the local key is that the upstream credential never
+  // leaves this process; reusing it as the client-facing key hands it out.
+  if (values.LOCAL_PROXY_KEY !== undefined && values.UPSTREAM_API_KEY !== undefined && values.LOCAL_PROXY_KEY === values.UPSTREAM_API_KEY) {
+    problems.push("LOCAL_PROXY_KEY: expected a secret of its own, but it is the same value as UPSTREAM_API_KEY (the value received is not shown)");
+  }
 
   if (problems.length > 0) {
     const report = [
@@ -128,7 +183,9 @@ const config = (() => {
 
 const host = config.HOST;
 const port = config.PORT;
-const proxyVersion = "3.0.0";
+const healthPort = config.HEALTH_PORT;
+const allowedHosts = config.ALLOWED_HOSTS;
+const proxyVersion = "4.0.0";
 const nodeRuntimeVersion = process.version;
 const upstreamBaseUrl = config.UPSTREAM_BASE_URL;
 const apiKey = config.UPSTREAM_API_KEY;
@@ -243,6 +300,7 @@ const stats = {
   emptyStreamsRecovered: 0,
   streamsClosedOnTerminalFrame: 0,
   authRejected: 0,
+  hostRejected: 0,
   responsesBridged: 0,
   responsesStored: 0,
   responsesStoreHits: 0,
@@ -257,8 +315,12 @@ const logBodyLimit = config.PROXY_LOG_BODY_LIMIT;
 
 function redactSecrets(value) {
   let text = String(value ?? "");
-  for (const secret of [apiKey, localProxyKey]) {
-    if (secret && secret.length > 3) text = text.split(secret).join(`${secret.slice(0, 6)}…REDACTED`);
+  // The marker names which secret matched but reveals none of it. A prefix would
+  // put real key bytes into the console log and the trace file, which is the one
+  // thing this function exists to keep out of them. The length floor is a safety
+  // net: a pathologically short secret would otherwise match everywhere.
+  for (const [name, secret] of [["UPSTREAM_API_KEY", apiKey], ["LOCAL_PROXY_KEY", localProxyKey]]) {
+    if (secret && secret.length > 3) text = text.split(secret).join(`[REDACTED:${name}]`);
   }
   return text;
 }
@@ -283,7 +345,12 @@ const traceBodyLimit = config.PROXY_TRACE_BODY_LIMIT;
 function traceInit() {
   if (!traceEnabled) return;
   try {
-    fs.writeFileSync(traceFile, `# Proxy trace started ${new Date().toISOString()}\n`);
+    // The trace holds whole prompts and completions in plaintext, so it is owner
+    // only. The mode passed here applies to a file being created; a trace left
+    // behind by an earlier run keeps whatever permissions it already had, which
+    // is what the explicit chmod is for.
+    fs.writeFileSync(traceFile, `# Proxy trace started ${new Date().toISOString()}\n`, { mode: 0o600 });
+    fs.chmodSync(traceFile, 0o600);
     console.log(`Tracing every request and response to ${traceFile}`);
   } catch (error) {
     console.error(`Could not open trace file ${traceFile}: ${error.message}`);
@@ -314,10 +381,13 @@ class HttpError extends Error {
   }
 }
 
+// Digests rather than the raw values: both buffers are then always 32 bytes, so
+// the comparison can no longer be short-circuited on length and its timing says
+// nothing about how long the real key is.
 function safeEqual(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
-  return left.length === right.length && crypto.timingSafeEqual(left, right);
+  const left = crypto.createHash("sha256").update(String(a)).digest();
+  const right = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(left, right);
 }
 
 function clientToken(headers) {
@@ -340,16 +410,77 @@ function sendJson(res, status, value, extraHeaders = {}) {
   res.end(body);
 }
 
-// Every route the proxy serves. All four are POST-only; /health is answered
-// before authentication and is not in the table. The 404 text is derived from
-// the same list so the advertised endpoints cannot drift from the served ones.
+// Loopback names for the health listener below, deliberately hardcoded instead
+// of read from ALLOWED_HOSTS: that setting exists so the operator can name the
+// public hostname their reverse proxy uses, and nothing they put there should be
+// able to widen an endpoint that is meant to be reachable from inside the
+// container only. The IPv6 entry is bracketed because that is the form
+// `new URL()` produces for an IPv6 authority, and matching happens on its output.
+const loopbackHosts = Object.freeze(["127.0.0.1", "localhost", "[::1]"]);
+
+// The one definition of "a request this listener is willing to answer", shared
+// by both servers so the public port and the health port cannot drift apart.
+//
+// Matching is on hostname alone. Under Docker the published port routinely
+// differs from the port the server binds inside the container, so comparing
+// host:port would reject every request that arrived through a remapped port
+// while adding nothing: the port a request reached is already decided by which
+// socket accepted it.
+//
+// Returns true when the request has been answered and the caller must stop.
+function rejectedByHostGuard(req, res, allowedHostnames) {
+  const hostHeader = req.headers.host;
+  const origin = req.headers.origin;
+  const secFetchSite = req.headers["sec-fetch-site"];
+  let rejection = null;
+
+  if (!hostHeader) {
+    rejection = "no Host header";
+  } else if (origin !== undefined) {
+    // No CLI client sends either header and a browser always sends at least one,
+    // so their presence means a page is driving the request. Refusing them is
+    // what stops DNS rebinding: the attacker's page can point a name at this
+    // address, but it cannot strip the headers the browser attaches.
+    rejection = `browser Origin ${origin}`;
+  } else if (secFetchSite !== undefined) {
+    rejection = `browser Sec-Fetch-Site ${secFetchSite}`;
+  } else {
+    let hostname = null;
+    try {
+      // Parsed rather than split on ":": this is what makes [::1]:18989 and an
+      // ordinary host:port both resolve correctly, and what collapses userinfo
+      // smuggling such as 127.0.0.1@evil.com down to the hostname the request
+      // will really be routed as. Garbage throws, and throwing is a rejection.
+      hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase();
+    } catch {
+      hostname = null;
+    }
+    if (!hostname || !allowedHostnames.includes(hostname)) rejection = `Host ${hostHeader}`;
+  }
+
+  if (rejection === null) return false;
+
+  stats.hostRejected += 1;
+  // Logged but never echoed: the reply tells a prober nothing about which hosts
+  // this proxy does answer to.
+  log(req._proxyRequestId || "--------", "->CL", `rejected: ${rejection}`);
+  sendJson(res, 403, {
+    type: "error",
+    error: { type: "forbidden", message: "This proxy does not serve requests for that host." }
+  });
+  return true;
+}
+
+// Every route the proxy serves. All four are POST-only. The 404 text is derived
+// from the same list so the advertised endpoints cannot drift from the served
+// ones.
 const servedPaths = new Set([
   "/v1/messages",
   "/v1/messages/count_tokens",
   "/v1/chat/completions",
   "/v1/responses"
 ]);
-const servedPathsMessage = `Supported endpoints: ${[...servedPaths].map((path) => `POST ${path}`).join(", ")}, GET /health.`;
+const servedPathsMessage = `Supported endpoints: ${[...servedPaths].map((path) => `POST ${path}`).join(", ")}.`;
 
 // The two OpenAI-shaped routes; the Anthropic ones use their own error envelope.
 const openAiErrorPaths = new Set(["/v1/chat/completions", "/v1/responses"]);
@@ -1606,9 +1737,13 @@ const server = http.createServer(async (req, res) => {
 
   res.once("finish", () => log(requestId, "<-CL", `${res.statusCode}`));
 
+  // Before anything else, and before the trace tap below: a request this server
+  // will not answer should leave no trace file entry for an attacker to grow.
+  if (rejectedByHostGuard(req, res, allowedHosts)) return;
+
   // Record every byte the proxy sends back to the client, so a stream that
   // never terminates is visible in the trace as a missing frame separator.
-  if (traceEnabled && req.url !== "/health") {
+  if (traceEnabled) {
     const originalWriteHead = res.writeHead.bind(res);
     const originalWrite = res.write.bind(res);
     const originalEnd = res.end.bind(res);
@@ -1637,19 +1772,9 @@ const server = http.createServer(async (req, res) => {
 
   let requestUrl;
   try {
-    requestUrl = new URL(req.url || "/", `http://${req.headers.host || `${host}:${port}`}`);
-
-    if (requestUrl.pathname === "/health") {
-      sendJson(res, 200, {
-        ok: true,
-        version: proxyVersion,
-        node: nodeRuntimeVersion,
-        uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
-        upstream: upstreamBaseUrl.origin,
-        stats: { ...stats }
-      });
-      return;
-    }
+    // Only an allow-listed Host header reaches this line, so there is no
+    // missing-header case left for a substitute authority to cover.
+    requestUrl = new URL(req.url || "/", `http://${req.headers.host}`);
 
     log(requestId, "->CL", `${req.method} ${requestUrl.pathname} auth=${clientToken(req.headers) ? "present" : "MISSING"}`);
     if (logVerbose) log(requestId, "->CL", `headers ${JSON.stringify(req.headers)}`);
@@ -1698,9 +1823,48 @@ server.headersTimeout = 65000;
 server.keepAliveTimeout = 5000;
 server.maxRequestsPerSocket = 1000;
 
+// Health lives on its own listener, and that listener is bound to loopback
+// rather than HOST. HOST is 0.0.0.0 inside a container, so serving health from
+// the main server would publish uptime, upstream origin and traffic counters to
+// the reverse proxy and therefore to the internet. Binding container-loopback
+// makes it unreachable from outside by construction, with no auth to get wrong,
+// while Docker's HEALTHCHECK — which runs inside the container — still reaches
+// it. Keeping it off the main port also keeps a 30s probe out of the trace file.
+const healthBindHost = "127.0.0.1";
+
+const healthServer = http.createServer((req, res) => {
+  if (rejectedByHostGuard(req, res, loopbackHosts)) return;
+
+  // Split rather than parsed: the probe's exact request target is not this
+  // file's to dictate, so /health?probe=1 has to answer like /health.
+  const pathname = String(req.url || "/").split("?")[0];
+  if (req.method !== "GET" || pathname !== "/health") {
+    sendJson(res, 404, {
+      type: "error",
+      error: { type: "not_found", message: "This listener serves GET /health only." }
+    });
+    return;
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    version: proxyVersion,
+    node: nodeRuntimeVersion,
+    uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
+    upstream: upstreamBaseUrl.origin,
+    stats: { ...stats }
+  });
+});
+
 function shutdown(signal) {
   console.log(`Received ${signal}; shutting down Local API Proxy v${proxyVersion}.`);
-  server.close(() => process.exit(0));
+  let closing = 2;
+  const closed = () => {
+    closing -= 1;
+    if (closing === 0) process.exit(0);
+  };
+  server.close(closed);
+  healthServer.close(closed);
   setTimeout(() => process.exit(1), 5000).unref();
 }
 
@@ -1709,5 +1873,10 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(port, host, () => {
   console.log(`Local API Proxy v${proxyVersion} listening on http://${host}:${port} with ${nodeRuntimeVersion}`);
+  console.log(`Answering requests for these hosts only: ${allowedHosts.join(", ")}`);
   traceInit();
+});
+
+healthServer.listen(healthPort, healthBindHost, () => {
+  console.log(`Health endpoint listening on http://${healthBindHost}:${healthPort}/health (this host only)`);
 });

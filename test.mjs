@@ -7,8 +7,14 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const testApiKey = "test-upstream-key-never-leaves-mock";
-const localKey = "test-local-proxy-key";
+// Both keys are deliberately unlike each other: neither contains the other and
+// they share no six-character prefix, so a redaction assertion on the trace file
+// below can tell "this secret leaked" apart from "this text merely resembles
+// it". Neither prefix occurs anywhere else in the suite either -- a key starting
+// "test-" would collide with the "test-lingering" model id. LOCAL_PROXY_KEY also
+// has to clear the proxy's 32-character floor or the proxy refuses to start.
+const testApiKey = "Zq7upstreamKeyNeverLeavesTheMock9Xv";
+const localKey = "Kd4localProxySharedSecretForTests7Wm";
 const captured = [];
 const lingeringResponses = [];
 const preservedSession = "123e4567-e89b-42d3-a456-426614174000";
@@ -161,11 +167,22 @@ const upstream = http.createServer((req, res) => {
   });
 });
 
+// Two free ports are needed now: the public one and the health listener's. Both
+// probes are held open at the same time before either is released, because
+// closing the first one before asking for the second lets the kernel hand back
+// the same number twice -- and two identical ports is the one combination the
+// proxy refuses to start on.
 const upstreamPort = await listen(upstream);
 const probe = http.createServer();
+const healthProbe = http.createServer();
 const proxyPort = await listen(probe);
+const healthPort = await listen(healthProbe);
 probe.close();
-await once(probe, "close");
+healthProbe.close();
+// Both listeners are attached before either close is awaited: awaiting the first
+// one hands control back to the event loop, and the second server's "close" can
+// fire during that turn, with nothing listening for it yet.
+await Promise.all([once(probe, "close"), once(healthProbe, "close")]);
 
 // proxy.mjs requires every variable and has no defaults, so the suite supplies
 // the full set explicitly. No `...process.env` spread: the run has to be
@@ -175,6 +192,10 @@ const traceFilePath = join(tmpdir(), `proxy-test-trace-${process.pid}.log`);
 const proxyEnv = {
   HOST: "127.0.0.1",
   PORT: String(proxyPort),
+  HEALTH_PORT: String(healthPort),
+  // Both names the suite reaches this proxy under. Everything else, including
+  // the DNS-rebinding names a browser could point at 127.0.0.1, is refused.
+  ALLOWED_HOSTS: "127.0.0.1,localhost",
   UPSTREAM_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
   UPSTREAM_API_KEY: testApiKey,
   LOCAL_PROXY_KEY: localKey,
@@ -207,10 +228,13 @@ const authHeaders = {
   "content-type": "application/json"
 };
 
+// Readiness is read from the health listener, which is the only place /health is
+// served now. It is the second of the proxy's two listeners to be started, so an
+// answer here means the public port is already accepting too.
 async function waitForProxy() {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
-      const response = await fetch(`http://127.0.0.1:${proxyPort}/health`);
+      const response = await fetch(`http://127.0.0.1:${healthPort}/health`);
       if (response.ok) return;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -226,26 +250,48 @@ async function post(path, payload, extraHeaders = {}) {
   });
 }
 
-// fetch() always attaches its own User-Agent, so a truly bare client needs the
-// raw http client. This is the only caller the header defaults serve.
-function postWithoutUserAgent(path, payload) {
+// fetch() attaches its own User-Agent and flatly refuses to set Host, so every
+// case that needs control over what leaves the client -- the header defaults, and
+// all of the Host guard cases -- goes through the raw client instead.
+// `setHost: false` is what leaves the Host header off the wire entirely.
+function rawRequest({ method = "GET", path = "/", headers = {}, body = undefined, port = proxyPort, omitHost = false } = {}) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify(payload);
+    const payload = body === undefined ? null : (typeof body === "string" ? body : JSON.stringify(body));
     const request = http.request({
       host: "127.0.0.1",
-      port: proxyPort,
+      port,
       path,
-      method: "POST",
-      headers: { authorization: `Bearer ${localKey}`, "content-length": Buffer.byteLength(body) }
+      method,
+      setHost: !omitHost,
+      headers: {
+        ...headers,
+        ...(payload === null ? {} : { "content-length": Buffer.byteLength(payload) })
+      }
     }, (response) => {
       let text = "";
       response.setEncoding("utf8");
       response.on("data", (chunk) => { text += chunk; });
-      response.on("end", () => resolve({ status: response.statusCode, text }));
+      response.on("end", () => resolve({ status: response.statusCode, headers: response.headers, text }));
     });
     request.on("error", reject);
-    request.end(body);
+    request.end(payload ?? undefined);
   });
+}
+
+// Every guard rejection has to look the same from outside: one status, one
+// shape, and nothing a prober can learn from. Rejections are counted here so the
+// stats.hostRejected assertion later can be an exact figure rather than a floor.
+let hostRejectionsCaused = 0;
+function assertForbidden(response, rejectedValue, why) {
+  assert.equal(response.status, 403, `${why} must be refused with 403, got ${response.status}: ${response.text}`);
+  const body = JSON.parse(response.text);
+  assert.equal(body.type, "error");
+  assert.equal(body.error.type, "forbidden");
+  // The reply must not echo what was rejected, and must not name what would have
+  // been accepted: either one turns the guard into an oracle for the allow-list.
+  assert.ok(!response.text.includes(rejectedValue), `403 body echoed ${rejectedValue} back: ${response.text}`);
+  assert.doesNotMatch(response.text, /127\.0\.0\.1|localhost/, `403 body named the allow-list: ${response.text}`);
+  hostRejectionsCaused += 1;
 }
 
 // Runs proxy.mjs to completion with a deliberately broken environment and
@@ -280,6 +326,11 @@ function envWithout(...names) {
   const partial = { ...proxyEnv };
   for (const name of names) delete partial[name];
   return partial;
+}
+
+// The sibling for values that are present but unusable, rather than absent.
+function envWith(overrides) {
+  return { ...proxyEnv, ...overrides };
 }
 
 try {
@@ -576,17 +627,170 @@ try {
   });
   assert.equal(invalidJson.status, 400);
 
-  const healthResponse = await fetch(`http://127.0.0.1:${proxyPort}/health`);
+  // -------------------------------------------------------------------------
+  // Host guard. This proxy is meant to sit on a public address, so it answers
+  // only for the hostnames it was configured with, and it decides that before it
+  // does anything else. Every case here uses the raw client: fetch() will not
+  // let a caller set Host.
+  // -------------------------------------------------------------------------
+  const guardBody = { model: "claude-opus-4-8", max_tokens: 8, messages: [{ role: "user", content: "x" }] };
+
+  // A name that resolves to this address but is not in ALLOWED_HOSTS is refused.
+  // This is the shape a DNS rebinding page arrives in, and the shape of a stray
+  // virtual host pointed at the port by someone scanning for one.
+  assertForbidden(
+    await rawRequest({ method: "POST", path: "/v1/messages", headers: { ...authHeaders, host: "evil.com" }, body: guardBody }),
+    "evil.com",
+    "a Host outside ALLOWED_HOSTS"
+  );
+
+  // The configured host takes the ordinary path all the way through to upstream:
+  // the guard is a filter, not a wrapper that changes what a served request does.
+  const allowedHost = await rawRequest({
+    method: "POST",
+    path: "/v1/messages",
+    headers: { ...authHeaders, host: `127.0.0.1:${proxyPort}` },
+    body: guardBody
+  });
+  assert.equal(allowedHost.status, 200, `an allow-listed Host must be served: ${allowedHost.text}`);
+  assert.match(allowedHost.text, /"text":"OK"/);
+
+  // Matching is on hostname alone, so the second allow-list entry works and the
+  // port in the Host header is ignored. That is deliberate: with Docker the
+  // published port routinely differs from the one the server bound inside the
+  // container, and which port a request arrived on is already settled by which
+  // socket accepted it.
+  const allowedOtherPort = await rawRequest({
+    method: "POST",
+    path: "/v1/messages",
+    headers: { ...authHeaders, host: "localhost:9999" },
+    body: guardBody
+  });
+  assert.equal(allowedOtherPort.status, 200, `hostname matching must ignore the port: ${allowedOtherPort.text}`);
+
+  // Userinfo smuggling: everything before "@" is credentials, so this request is
+  // really addressed to evil.com. Parsing the Host instead of splitting it on
+  // ":" is what collapses it to the hostname routing would actually use.
+  assertForbidden(
+    await rawRequest({ method: "POST", path: "/v1/messages", headers: { ...authHeaders, host: "127.0.0.1@evil.com" }, body: guardBody }),
+    "127.0.0.1@evil.com",
+    "userinfo smuggled into Host"
+  );
+
+  // Garbage no parser can turn into a hostname is a rejection, not a 500: the
+  // guard treats a throw as a refusal rather than letting it reach the handler.
+  assertForbidden(
+    await rawRequest({ method: "POST", path: "/v1/messages", headers: { ...authHeaders, host: "::::" }, body: guardBody }),
+    "::::",
+    "an unparseable Host"
+  );
+
+  // A request with no Host header at all never reaches the guard. Node's own
+  // server runs with requireHostHeader on, so an HTTP/1.1 request without one is
+  // answered 400 by the HTTP parser before the request handler is called. It is
+  // still rejected -- just one layer below this proxy, which is why the expected
+  // status is 400 and why this rejection is not counted in stats.hostRejected.
+  const missingHost = await rawRequest({
+    method: "POST",
+    path: "/v1/messages",
+    omitHost: true,
+    headers: authHeaders,
+    body: guardBody
+  });
+  assert.equal(missingHost.status, 400, `a request with no Host header must be rejected, got ${missingHost.status}`);
+
+  // No CLI client sends Origin or Sec-Fetch-Site and a browser always sends at
+  // least one, so their presence means a page is driving the request. Refusing
+  // them is the other half of the rebinding defence: an attacker's page can aim
+  // a name at this address, but it cannot make the browser drop these headers.
+  assertForbidden(
+    await rawRequest({
+      method: "POST",
+      path: "/v1/messages",
+      headers: { ...authHeaders, host: `127.0.0.1:${proxyPort}`, origin: "https://evil.example" },
+      body: guardBody
+    }),
+    "https://evil.example",
+    "a browser Origin"
+  );
+  assertForbidden(
+    await rawRequest({
+      method: "POST",
+      path: "/v1/messages",
+      headers: { ...authHeaders, host: `127.0.0.1:${proxyPort}`, "sec-fetch-site": "cross-site" },
+      body: guardBody
+    }),
+    "cross-site",
+    "a browser Sec-Fetch-Site"
+  );
+
+  // The guard runs before authentication, so a wrong host with no credentials is
+  // 403 and never reaches the key comparison. If auth ran first this would be
+  // 401, which would confirm to a prober that an API lives here at all.
+  const evilNoAuth = await rawRequest({
+    method: "POST",
+    path: "/v1/messages",
+    headers: { "content-type": "application/json", host: "evil.com" },
+    body: guardBody
+  });
+  assert.notEqual(evilNoAuth.status, 401, "the host guard must run before auth, not after");
+  assertForbidden(evilNoAuth, "evil.com", "an unauthenticated request from a rejected host");
+
+  // -------------------------------------------------------------------------
+  // Health moved off the public port onto its own loopback-only listener.
+  // -------------------------------------------------------------------------
+
+  // On the main port /health is now an ordinary unserved path, and the 404 text
+  // -- generated from the route table -- no longer advertises that it exists.
+  const mainPortHealth = await fetch(`http://127.0.0.1:${proxyPort}/health`);
+  assert.equal(mainPortHealth.status, 404);
+  const mainPortHealthJson = await mainPortHealth.json();
+  assert.equal(mainPortHealthJson.error.type, "not_found");
+  assert.doesNotMatch(mainPortHealthJson.error.message, /health/i);
+
+  // Docker's HEALTHCHECK runs inside the container and may write the request
+  // target however it likes, so a query string has to answer like a bare path.
+  const probeQuery = await fetch(`http://127.0.0.1:${healthPort}/health?probe=1`);
+  assert.equal(probeQuery.status, 200);
+  assert.equal((await probeQuery.json()).ok, true);
+
+  // The same guard runs on the health listener, against a hardcoded loopback
+  // list rather than ALLOWED_HOSTS: nothing an operator puts in that variable
+  // can widen an endpoint meant to be reachable from inside the container only.
+  assertForbidden(
+    await rawRequest({ path: "/health", port: healthPort, headers: { host: "evil.com" } }),
+    "evil.com",
+    "a non-loopback Host on the health port"
+  );
+
+  // Nothing but GET /health lives on that listener; it is not a second API.
+  const healthPost = await rawRequest({ method: "POST", path: "/health", port: healthPort, body: {} });
+  assert.equal(healthPost.status, 404);
+  assert.equal(JSON.parse(healthPost.text).error.type, "not_found");
+
+  // Health carries no credentials at all, which is only safe because the socket
+  // is bound to 127.0.0.1 rather than to HOST: on 0.0.0.0 this would publish
+  // uptime, the upstream origin and traffic counters to the whole internet.
+  const healthResponse = await fetch(`http://127.0.0.1:${healthPort}/health`);
   const health = await healthResponse.json();
   assert.equal(healthResponse.status, 200);
-  assert.equal(health.version, "3.0.0");
+  assert.deepEqual(Object.keys(health).sort(), ["node", "ok", "stats", "upstream", "uptime_seconds", "version"]);
+  assert.equal(health.ok, true);
+  assert.equal(health.version, "4.0.0");
   assert.equal(health.node, process.version);
+  assert.equal(health.upstream, `http://127.0.0.1:${upstreamPort}`);
   assert.ok(health.stats.normalizedTo429 >= 2);
   assert.ok(health.stats.droppedSseFrames >= 5);
   assert.ok(health.stats.emptyStreamsRecovered >= 1);
   assert.ok(health.stats.authRejected >= 1);
   assert.ok(health.stats.responsesBridged >= 4);
   assert.ok(health.stats.responsesStoreHits >= 1);
+
+  // Exact rather than a floor: the suite is hermetic, so the requests it made are
+  // every request this process has ever seen. An extra rejection here would mean
+  // the guard turned away something the suite expected to be served, and a
+  // missing one would mean a rejection was answered without being recorded.
+  assert.equal(health.stats.hostRejected, hostRejectionsCaused);
 
   // Inspect actual upstream wire image.
   const first = captured[0];
@@ -617,11 +821,14 @@ try {
 
   // ...but a bare client that sends neither still gets a usable request upstream:
   // the synthesized User-Agent plus the content-type and anthropic-version the
-  // gateway requires. This is the only path these defaults exist for.
-  const bareResponse = await postWithoutUserAgent("/v1/messages", {
-    model: "claude-opus-4-8",
-    max_tokens: 8,
-    messages: [{ role: "user", content: "hi" }]
+  // gateway requires. This is the only path these defaults exist for, and the raw
+  // client is how the suite gets to be that bare -- fetch() always signs its own
+  // requests with a User-Agent.
+  const bareResponse = await rawRequest({
+    method: "POST",
+    path: "/v1/messages",
+    headers: { authorization: `Bearer ${localKey}` },
+    body: { model: "claude-opus-4-8", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }
   });
   assert.equal(bareResponse.status, 200, `bare client got ${bareResponse.status}: ${bareResponse.text}`);
   const bare = captured.at(-1);
@@ -637,6 +844,35 @@ try {
   assert.equal(first.headers["accept-encoding"], "identity");
   assert.match(first.url, /^\/v1\/messages\?beta=true$/);
 
+  // -------------------------------------------------------------------------
+  // The trace file. It holds whole prompts and completions in plaintext and it
+  // records the headers of both legs, so both API keys pass through it.
+  // -------------------------------------------------------------------------
+
+  // Owner-only on disk: on a shared host, mode 0644 would hand every local
+  // account the conversations this proxy carried.
+  const traceMode = fs.statSync(traceFilePath).mode & 0o777;
+  assert.equal(traceMode, 0o600, `trace file mode is 0${traceMode.toString(8)}, expected 0600`);
+
+  const traceText = fs.readFileSync(traceFilePath, "utf8");
+
+  // The markers prove redaction actually ran on both legs. Without them, the
+  // absence assertions below would also pass on an empty or truncated file.
+  assert.ok(traceText.includes("[REDACTED:UPSTREAM_API_KEY]"), "upstream key was never redacted in the trace");
+  assert.ok(traceText.includes("[REDACTED:LOCAL_PROXY_KEY]"), "local key was never redacted in the trace");
+
+  // Not one character of either secret survives. A marker that kept even a short
+  // prefix -- the usual "sk-abc…" courtesy -- would hand anyone who can read this
+  // file a head start on the key it is there to protect.
+  for (const [name, secret] of [["UPSTREAM_API_KEY", testApiKey], ["LOCAL_PROXY_KEY", localKey]]) {
+    assert.ok(!traceText.includes(secret), `${name} appears verbatim in the trace`);
+    assert.ok(!traceText.includes(secret.slice(0, 6)), `a prefix of ${name} appears in the trace`);
+  }
+
+  // -------------------------------------------------------------------------
+  // Startup configuration. Every case below dies inside config validation.
+  // -------------------------------------------------------------------------
+
   // Startup refuses to run on an incomplete environment, and names every
   // offending variable in one pass instead of one restart per variable.
   const missingVars = await runProxyToExit(envWithout("LOCAL_PROXY_KEY", "UPSTREAM_TIMEOUT_MS"));
@@ -646,20 +882,80 @@ try {
   assert.match(missingVars.stderr, /2 environment variable problems/);
   assert.equal(missingVars.stdout, "");
 
+  // The two variables the guard and the health listener need are required like
+  // every other one. Neither may acquire a default: guessing an allow-list or a
+  // health port would quietly restore the exposure this pair exists to close.
+  const missingGuardVars = await runProxyToExit(envWithout("ALLOWED_HOSTS", "HEALTH_PORT"));
+  assert.notEqual(missingGuardVars.code, 0);
+  assert.match(missingGuardVars.stderr, /ALLOWED_HOSTS/);
+  assert.match(missingGuardVars.stderr, /HEALTH_PORT/);
+  assert.match(missingGuardVars.stderr, /2 environment variable problems/);
+
+  // Comparisons between variables may only run once both sides have actually
+  // parsed. With PORT and HEALTH_PORT both unset the report must be exactly the
+  // two "not set" problems: a bare `values.PORT === values.HEALTH_PORT` finds
+  // undefined equal to undefined and adds a third problem saying the two ports
+  // collide, which is untrue and sends the operator hunting for a port conflict
+  // instead of reading the two real problems above it.
+  const bothPortsMissing = await runProxyToExit(envWithout("PORT", "HEALTH_PORT"));
+  assert.notEqual(bothPortsMissing.code, 0);
+  assert.match(bothPortsMissing.stderr, /2 environment variable problems/);
+  assert.doesNotMatch(bothPortsMissing.stderr, /a port of its own/);
+
+  // Health needs a port of its own; sharing PORT would put the counters and the
+  // upstream origin it publishes straight back onto the public address.
+  const clashingPorts = await runProxyToExit(envWith({ HEALTH_PORT: proxyEnv.PORT }));
+  assert.notEqual(clashingPorts.code, 0);
+  assert.match(clashingPorts.stderr, /HEALTH_PORT: expected a port of its own/);
+  assert.match(clashingPorts.stderr, /1 environment variable problem\./);
+
+  // The local key is the only thing between the open internet and a paid
+  // upstream credential, so it has to be generated rather than chosen. A short
+  // placeholder is refused, and the operator is handed the command that produces
+  // an acceptable one instead of being left to guess at the floor.
+  const shortLocalKey = await runProxyToExit(envWith({ LOCAL_PROXY_KEY: "sk-dummy" }));
+  assert.notEqual(shortLocalKey.code, 0);
+  assert.match(shortLocalKey.stderr, /LOCAL_PROXY_KEY: expected at least 32 characters/);
+  assert.match(shortLocalKey.stderr, /openssl rand -base64 32/);
+  assert.match(shortLocalKey.stderr, /1 environment variable problem\./);
+  assert.doesNotMatch(shortLocalKey.stderr, /sk-dummy/);
+
+  // Reusing the upstream credential as the client-facing key would hand it to
+  // every client that connects, which is the one outcome the split prevents.
+  const reusedKey = await runProxyToExit(envWith({ LOCAL_PROXY_KEY: testApiKey }));
+  assert.notEqual(reusedKey.code, 0);
+  assert.match(reusedKey.stderr, /LOCAL_PROXY_KEY: expected a secret of its own/);
+  assert.match(reusedKey.stderr, /same value as UPSTREAM_API_KEY/);
+  assert.match(reusedKey.stderr, /1 environment variable problem\./);
+  assert.ok(!reusedKey.stderr.includes(testApiKey.slice(0, 6)), "the rejected key leaked into stderr");
+
+  // The upstream key has a floor of its own, low enough for the short keys some
+  // gateways issue but high enough to catch a truncated paste.
+  const shortUpstreamKey = await runProxyToExit(envWith({ UPSTREAM_API_KEY: "Ry3tiny" }));
+  assert.notEqual(shortUpstreamKey.code, 0);
+  assert.match(shortUpstreamKey.stderr, /UPSTREAM_API_KEY: expected at least 8 characters/);
+  assert.match(shortUpstreamKey.stderr, /1 environment variable problem\./);
+  assert.doesNotMatch(shortUpstreamKey.stderr, /Ry3tiny/);
+
   // Present but unusable fails the same way, and a rejected secret is never
-  // echoed back into stderr. There is no length floor on LOCAL_PROXY_KEY --
-  // sk-dummy is a supported choice -- so this uses a newline, which is rejected
-  // because the value ends up in an HTTP header.
-  const invalidVars = await runProxyToExit({
-    ...proxyEnv,
+  // echoed back into stderr -- stderr ends up in container logs. This value is
+  // long enough to clear the 32-character floor and still fails, because it
+  // carries a newline: a control character is refused on its own, since the
+  // value ends up in an HTTP header. Keeping it above the floor is what makes
+  // the control-character rule the thing under test here rather than the length.
+  const invalidVars = await runProxyToExit(envWith({
     PORT: "abc",
     PROXY_TRACE: "1",
-    LOCAL_PROXY_KEY: "leaky\nsecret"
-  });
+    LOCAL_PROXY_KEY: "Wq5leakyEmbeddedNewlineSecretPad\nTail"
+  }));
   assert.notEqual(invalidVars.code, 0);
   assert.match(invalidVars.stderr, /PORT: expected an integer between 1 and 65535, got "abc"/);
   assert.match(invalidVars.stderr, /PROXY_TRACE: expected exactly "true" or "false"/);
   assert.match(invalidVars.stderr, /LOCAL_PROXY_KEY/);
+  // Exactly the three variables this case broke, and no fourth: what is reported
+  // has to be the injected failures themselves, not a knock-on problem derived
+  // from one of them.
+  assert.match(invalidVars.stderr, /3 environment variable problems/);
   assert.doesNotMatch(invalidVars.stderr, /leaky/);
 
   console.log(`All Local API Proxy v${health.version} tests passed (${captured.length} upstream requests).`);
