@@ -7,7 +7,7 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const testApiKey = "test-anyrouter-key-never-leaves-mock";
+const testApiKey = "test-upstream-key-never-leaves-mock";
 const localKey = "test-local-proxy-key";
 const captured = [];
 const lingeringResponses = [];
@@ -42,7 +42,7 @@ function writeAnthropicToolStream(res) {
   res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
 }
 
-// Mirrors Any Router: "\n\n\n" frame separators, and the socket is deliberately
+// Mirrors the gateway: "\n\n\n" frame separators, and the socket is deliberately
 // held open after message_stop instead of being closed.
 function writeLingeringAnthropicStream(res) {
   res.writeHead(200, { "content-type": "text/event-stream" });
@@ -166,21 +166,18 @@ await once(probe, "close");
 // the full set explicitly. No `...process.env` spread: the run has to be
 // hermetic, otherwise a developer shell that happens to export these would hide
 // a missing variable here and the suite would fail only in CI or in a container.
-const traceFilePath = join(tmpdir(), `anyrouter-proxy-test-trace-${process.pid}.log`);
+const traceFilePath = join(tmpdir(), `proxy-test-trace-${process.pid}.log`);
 const proxyEnv = {
   HOST: "127.0.0.1",
   PORT: String(proxyPort),
-  ANYROUTER_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
-  ANYROUTER_API_KEY: testApiKey,
+  UPSTREAM_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+  UPSTREAM_API_KEY: testApiKey,
   LOCAL_PROXY_KEY: localKey,
   CLAUDE_CODE_VERSION: "0.0.0-test",
-  ANYROUTER_MODEL: "claude-opus-4-8",
+  UPSTREAM_MODEL: "claude-opus-4-8",
   UPSTREAM_TIMEOUT_MS: "300000",
   RETRY_AFTER_SECONDS: "11",
   MAX_BODY_BYTES: "26214400",
-  ANYROUTER_WIRE_OS: "TestOS",
-  ANYROUTER_WIRE_ARCH: "test-arch",
-  ANYROUTER_STAINLESS_VERSION: "0.0.0-test",
   RESPONSES_STORE_MAX: "128",
   PROXY_LOG: "true",
   PROXY_LOG_VERBOSE: "false",
@@ -224,6 +221,28 @@ async function post(path, payload, extraHeaders = {}) {
   });
 }
 
+// fetch() always attaches its own User-Agent, so a truly bare client needs the
+// raw http client. This is the only caller the surviving header defaults serve.
+function postWithoutUserAgent(path, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const request = http.request({
+      host: "127.0.0.1",
+      port: proxyPort,
+      path,
+      method: "POST",
+      headers: { authorization: `Bearer ${localKey}`, "content-length": Buffer.byteLength(body) }
+    }, (response) => {
+      let text = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { text += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode, text }));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
+
 // Runs proxy.mjs to completion with a deliberately broken environment and
 // reports how it died. These children exit inside config validation, so they
 // never reach server.listen and cannot collide with the proxy under test.
@@ -261,19 +280,22 @@ function envWithout(...names) {
 try {
   await waitForProxy();
 
-  // Local API auth is now actually enforced.
+  // Local API auth is enforced, and it runs before routing: an unauthenticated
+  // call to a path the proxy no longer serves is still 401, not 404.
   const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/models`);
   assert.equal(rejected.status, 401);
   const rejectedBody = await rejected.json();
   assert.equal(rejectedBody.type, "error");
 
+  // /v1/models is gone -- the proxy has no way to know what the gateway serves,
+  // so it no longer invents a catalogue.
   const modelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/v1/models`, {
     headers: { authorization: `Bearer ${localKey}` }
   });
-  const models = await modelsResponse.json();
-  assert.equal(modelsResponse.status, 200);
-  assert.equal(models.object, "list");
-  assert.ok(models.data.some((model) => model.id === "claude-opus-4-8"));
+  assert.equal(modelsResponse.status, 404);
+  const modelsBody = await modelsResponse.json();
+  assert.equal(modelsBody.error.type, "not_found");
+  assert.doesNotMatch(modelsBody.error.message, /v1\/models/);
 
   // Streaming + SSE sanitation + beta merge + session preservation.
   const streamedAnthropic = await post("/v1/messages", {
@@ -443,7 +465,7 @@ try {
   const rateJson = await rate.json();
   assert.equal(rate.status, 429);
   assert.equal(rate.headers.get("retry-after"), "7");
-  assert.equal(rate.headers.get("x-anyrouter-proxy-original-status"), "403");
+  assert.equal(rate.headers.get("x-proxy-original-status"), "403");
   assert.equal(rateJson.error.type, "rate_limit_error");
 
   // OpenAI clients get an OpenAI-shaped normalized error too.
@@ -465,7 +487,7 @@ try {
     messages: [{ role: "user", content: "x" }]
   });
   assert.equal(permanentModel.status, 403);
-  assert.equal(permanentModel.headers.get("x-anyrouter-proxy-classification"), "permanent-pattern");
+  assert.equal(permanentModel.headers.get("x-proxy-classification"), "permanent-pattern");
 
   const tooLarge = await post("/v1/messages", {
     model: "test-413",
@@ -499,7 +521,7 @@ try {
   const emptyJson = await empty.json();
   assert.equal(empty.status, 503);
   assert.equal(empty.headers.get("retry-after"), "11");
-  assert.equal(empty.headers.get("x-anyrouter-proxy-classification"), "empty-stream");
+  assert.equal(empty.headers.get("x-proxy-classification"), "empty-stream");
   assert.match(emptyJson.error.message, /empty SSE stream/i);
 
   // A transient SSE error inside HTTP 200 is normalized before first token.
@@ -532,7 +554,7 @@ try {
   const healthResponse = await fetch(`http://127.0.0.1:${proxyPort}/health`);
   const health = await healthResponse.json();
   assert.equal(healthResponse.status, 200);
-  assert.equal(health.version, "2.1.0");
+  assert.equal(health.version, "3.0.0");
   assert.equal(health.node, process.version);
   assert.ok(health.stats.normalizedTo429 >= 2);
   assert.ok(health.stats.droppedSseFrames >= 5);
@@ -550,16 +572,38 @@ try {
   assert.equal(first.headers["x-api-key"], undefined);
   assert.equal(first.headers.host, `127.0.0.1:${upstreamPort}`);
 
-  // Client headers are forwarded verbatim rather than stripped.
+  // Client headers are forwarded verbatim rather than stripped. The proxy no
+  // longer synthesizes an SDK fingerprint, so these are the client's own values.
   assert.equal(first.headers["user-agent"], "claude-cli/2.1.233 (external, cli)");
   assert.equal(first.headers["x-stainless-retry-count"], "0");
   assert.equal(first.headers["x-stainless-timeout"], "60");
   assert.equal(first.headers["x-custom-client-header"], "forward-me");
 
-  // Wire-image defaults still fill in headers the client did not send.
-  assert.equal(first.headers["x-app"], "cli");
-  assert.equal(first.headers["x-stainless-runtime-version"], process.version);
+  // The only defaults left are the two a bare curl needs to reach the gateway.
   assert.equal(first.headers["anthropic-version"], "2023-06-01");
+  assert.equal(first.headers["content-type"], "application/json");
+
+  // Fabricated os/arch/package-version are gone: nothing invents them when the
+  // client did not send them.
+  assert.equal(first.headers["x-stainless-os"], undefined);
+  assert.equal(first.headers["x-stainless-arch"], undefined);
+  assert.equal(first.headers["x-stainless-package-version"], undefined);
+  assert.equal(first.headers["x-app"], undefined);
+
+  // ...but a bare client that sends neither still gets a usable request upstream:
+  // the synthesized User-Agent plus the content-type and anthropic-version the
+  // gateway requires. This is the only path these defaults exist for.
+  const bareResponse = await postWithoutUserAgent("/v1/messages", {
+    model: "claude-opus-4-8",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "hi" }]
+  });
+  assert.equal(bareResponse.status, 200, `bare client got ${bareResponse.status}: ${bareResponse.text}`);
+  const bare = captured.at(-1);
+  assert.equal(bare.headers["user-agent"], "claude-cli/0.0.0-test (external, sdk-cli)");
+  assert.equal(bare.headers["anthropic-version"], "2023-06-01");
+  assert.equal(bare.headers["content-type"], "application/json");
+  assert.equal(bare.headers["x-stainless-os"], undefined);
 
   assert.equal(first.headers["x-claude-code-session-id"], preservedSession);
   assert.ok(first.headers["anthropic-beta"].includes("claude-code-20250219"));
@@ -593,7 +637,7 @@ try {
   assert.match(invalidVars.stderr, /LOCAL_PROXY_KEY/);
   assert.doesNotMatch(invalidVars.stderr, /leaky/);
 
-  console.log(`All Any Router Local Proxy v2.1.0 tests passed (${captured.length} upstream requests).`);
+  console.log(`All Local API Proxy v${health.version} tests passed (${captured.length} upstream requests).`);
 } finally {
   for (const lingering of lingeringResponses) {
     try { lingering.end(); } catch {}

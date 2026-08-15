@@ -88,30 +88,27 @@ const config = (() => {
 
   readText("HOST", "a bind address with no spaces, such as 127.0.0.1 or 0.0.0.0", { pattern: /^\S+$/ });
   readInteger("PORT", "an integer between 1 and 65535", { min: 1, max: 65535 });
-  readUrl("ANYROUTER_BASE_URL", "an absolute http:// or https:// URL");
-  readText("ANYROUTER_API_KEY", "the upstream gateway key", { secret: true, pattern: headerValue });
+  readUrl("UPSTREAM_BASE_URL", "an absolute http:// or https:// URL");
+  readText("UPSTREAM_API_KEY", "the upstream gateway key", { secret: true, pattern: headerValue });
   // No length floor: this gate only guards a loopback-bound port, so a short
   // placeholder like sk-dummy is a legitimate choice.
   readText("LOCAL_PROXY_KEY", "the shared secret Claude Code sends back, such as sk-dummy", { secret: true, pattern: headerValue });
   readText("CLAUDE_CODE_VERSION", "a version string such as 2.1.197", { pattern: headerValue });
-  readText("ANYROUTER_MODEL", "a model id such as claude-opus-4-8");
+  readText("UPSTREAM_MODEL", "a model id such as claude-opus-4-8");
   readInteger("UPSTREAM_TIMEOUT_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });
   readInteger("RETRY_AFTER_SECONDS", "an integer of at least 1 (seconds)", { min: 1 });
   readInteger("MAX_BODY_BYTES", "an integer of at least 1048576 (1 MiB)", { min: 1024 * 1024 });
-  readText("ANYROUTER_WIRE_OS", "an x-stainless-os value such as MacOS", { pattern: headerValue });
-  readText("ANYROUTER_WIRE_ARCH", "an x-stainless-arch value such as arm64", { pattern: headerValue });
-  readText("ANYROUTER_STAINLESS_VERSION", "an x-stainless-package-version value such as 0.94.0", { pattern: headerValue });
   readInteger("RESPONSES_STORE_MAX", "an integer of at least 1", { min: 1 });
   readBoolean("PROXY_LOG", "console request logging");
   readBoolean("PROXY_LOG_VERBOSE", "header and body dumps in the console log");
   readInteger("PROXY_LOG_BODY_LIMIT", "an integer of at least 0 (characters; 0 truncates every logged body to nothing)", { min: 0 });
-  readText("PROXY_TRACE_FILE", "a file path for the request trace, such as /tmp/anyrouter-trace.log");
+  readText("PROXY_TRACE_FILE", "a file path for the request trace, such as /tmp/proxy-trace.log");
   readBoolean("PROXY_TRACE", "the verbatim request and response file trace");
   readInteger("PROXY_TRACE_BODY_LIMIT", "an integer of at least 0 (characters; 0 means no truncation)", { min: 0 });
 
   if (problems.length > 0) {
     const report = [
-      `Any Router Local Proxy cannot start: ${problems.length} environment variable problem${problems.length === 1 ? "" : "s"}.`,
+      `Local API Proxy cannot start: ${problems.length} environment variable problem${problems.length === 1 ? "" : "s"}.`,
       "Every variable is required and none of them has a default value.",
       ...problems.map((problem) => `  - ${problem}`),
       "Set every variable listed above and start the proxy again.",
@@ -131,29 +128,21 @@ const config = (() => {
 
 const host = config.HOST;
 const port = config.PORT;
-const proxyVersion = "2.1.0";
+const proxyVersion = "3.0.0";
 const nodeRuntimeVersion = process.version;
-const upstreamBaseUrl = config.ANYROUTER_BASE_URL;
-const apiKey = config.ANYROUTER_API_KEY;
+const upstreamBaseUrl = config.UPSTREAM_BASE_URL;
+const apiKey = config.UPSTREAM_API_KEY;
 const localProxyKey = config.LOCAL_PROXY_KEY;
 const claudeCodeVersion = config.CLAUDE_CODE_VERSION;
-const defaultModel = config.ANYROUTER_MODEL;
+const defaultModel = config.UPSTREAM_MODEL;
 const upstreamTimeoutMs = config.UPSTREAM_TIMEOUT_MS;
 const retryAfterSeconds = config.RETRY_AFTER_SECONDS;
 const maxBodyBytes = config.MAX_BODY_BYTES;
-const compatibilityOs = config.ANYROUTER_WIRE_OS;
-const compatibilityArch = config.ANYROUTER_WIRE_ARCH;
-const packageVersion = config.ANYROUTER_STAINLESS_VERSION;
 const responsesStoreMax = config.RESPONSES_STORE_MAX;
 
-const supportedModels = [
-  ["claude-opus-4-8", "Claude Opus 4.8 via Any Router"],
-  ["claude-opus-4-7", "Claude Opus 4.7 via Any Router"],
-  ["claude-opus-4-6", "Claude Opus 4.6 via Any Router"],
-  ["glm-5.2", "GLM 5.2 via Any Router"],
-  ["gpt-5.5", "GPT 5.5 via Any Router"]
-];
-
+// Betas the gateway is asked for on top of whatever the client sent. Claude Code
+// already sends most of these; context-1m-2025-08-07 and web-search-2025-03-05 are
+// the two it does not, so this list is a floor rather than a replacement.
 const requiredBetas = [
   "claude-code-20250219",
   "context-1m-2025-08-07",
@@ -294,7 +283,7 @@ const traceBodyLimit = config.PROXY_TRACE_BODY_LIMIT;
 function traceInit() {
   if (!traceEnabled) return;
   try {
-    fs.writeFileSync(traceFile, `# Any Router proxy trace started ${new Date().toISOString()}\n`);
+    fs.writeFileSync(traceFile, `# Proxy trace started ${new Date().toISOString()}\n`);
     console.log(`Tracing every request and response to ${traceFile}`);
   } catch (error) {
     console.error(`Could not open trace file ${traceFile}: ${error.message}`);
@@ -364,7 +353,7 @@ function sendHttpError(res, requestUrl, error) {
     return;
   }
   const status = error instanceof HttpError ? error.status : 502;
-  const type = error instanceof HttpError ? error.type : "anyrouter_proxy_error";
+  const type = error instanceof HttpError ? error.type : "proxy_error";
   const message = error instanceof Error ? error.message : String(error);
   sendJson(res, status, clientErrorShape(requestUrl, type, message));
 }
@@ -386,25 +375,6 @@ function readBody(req) {
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
-}
-
-function modelList() {
-  const models = [...supportedModels];
-  if (!models.some(([id]) => id === defaultModel)) {
-    models.unshift([defaultModel, `${defaultModel} via Any Router`]);
-  }
-  return {
-    object: "list",
-    data: models.map(([id, displayName]) => ({
-      id,
-      object: "model",
-      type: "model",
-      display_name: displayName
-    })),
-    has_more: false,
-    first_id: models[0][0],
-    last_id: models[models.length - 1][0]
-  };
 }
 
 function buildUpstreamPath(requestUrl, pathnameOverride = undefined) {
@@ -441,21 +411,14 @@ const requestHeadersProxyOwns = new Set([
   "authorization", "x-api-key", "api-key"
 ]);
 
-// Wire-image values used only when the client did not send its own.
-function wireImageDefaults() {
-  return {
-    "user-agent": `claude-cli/${claudeCodeVersion} (external, sdk-cli)`,
-    "x-stainless-lang": "js",
-    "x-stainless-package-version": packageVersion,
-    "x-stainless-os": compatibilityOs,
-    "x-stainless-arch": compatibilityArch,
-    "x-stainless-runtime": "node",
-    "x-stainless-runtime-version": nodeRuntimeVersion,
-    "x-app": "cli",
-    "anthropic-version": "2023-06-01",
-    "content-type": "application/json"
-  };
-}
+// Filled in only when the caller omitted them. Claude Code always sends its own,
+// so in practice these serve exactly one caller: a bare `curl`, which needs the
+// content-type and anthropic-version before the gateway will answer at all.
+const bareClientDefaults = {
+  "user-agent": `claude-cli/${claudeCodeVersion} (external, sdk-cli)`,
+  "anthropic-version": "2023-06-01",
+  "content-type": "application/json"
+};
 
 function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream) {
   const headers = {};
@@ -467,7 +430,7 @@ function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream) {
     headers[key] = value;
   }
 
-  for (const [name, value] of Object.entries(wireImageDefaults())) {
+  for (const [name, value] of Object.entries(bareClientDefaults)) {
     if (headers[name] === undefined) headers[name] = value;
   }
 
@@ -531,7 +494,7 @@ function requestUpstream(req, requestUrl, body, wantsStream, onResponse, pathnam
     }
   );
 
-  upstream.on("timeout", () => upstream.destroy(new Error("Any Router request timed out.")));
+  upstream.on("timeout", () => upstream.destroy(new Error("Upstream request timed out.")));
   upstream.on("error", (error) => {
     log(requestId, "<-UP", `network error: ${error.message}`);
     trace(requestId, "UPSTREAM-NETERR", error.message);
@@ -601,20 +564,15 @@ function sseErrorInfo(frame) {
     const message = String(error.message || "");
     const text = `${type} ${message}`.toLowerCase();
     if (type.includes("rate_limit") || transientErrorPatterns.some((pattern) => text.includes(pattern))) {
-      return { status: type.includes("rate_limit") ? 429 : 503, message: message || "Any Router returned a transient SSE error." };
+      return { status: type.includes("rate_limit") ? 429 : 503, message: message || "Upstream returned a transient SSE error." };
     }
     if (type.includes("overloaded") || type.includes("unavailable")) {
-      return { status: 503, message: message || "Any Router is temporarily unavailable." };
+      return { status: 503, message: message || "Upstream is temporarily unavailable." };
     }
   } catch {
     return null;
   }
   return null;
-}
-
-function isMeaningfulSseFrame(frame) {
-  const data = sseFrameData(frame);
-  return Boolean(data && data !== "[DONE]" && !shouldDropSseFrame(frame));
 }
 
 function parseSseEvents(buffer, onEvent) {
@@ -723,14 +681,14 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
       clientErrorShape(
         requestUrl,
         "rate_limit_error",
-        `Any Router returned a transient ${status}; normalized to 429 so the client can retry.`,
+        `Upstream returned a transient ${status}; normalized to 429 so the client can retry.`,
         "rate_limit_exceeded"
       ),
       {
         "retry-after": retryAfterFrom(upstreamRes.headers),
         "cache-control": "no-store",
-        "x-anyrouter-proxy-original-status": String(status),
-        "x-anyrouter-proxy-classification": classification.reason
+        "x-proxy-original-status": String(status),
+        "x-proxy-classification": classification.reason
       }
     );
     return;
@@ -738,7 +696,7 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
 
   const headers = stripHopByHopHeaders(upstreamRes.headers);
   headers["cache-control"] = "no-store";
-  headers["x-anyrouter-proxy-classification"] = classification.reason;
+  headers["x-proxy-classification"] = classification.reason;
 
   if (classification.kind === "retryable") {
     stats.retryablePassed += 1;
@@ -747,7 +705,7 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
       sendJson(
         res,
         status,
-        clientErrorShape(requestUrl, status === 429 ? "rate_limit_error" : "api_error", `Any Router returned retryable HTTP ${status}.`),
+        clientErrorShape(requestUrl, status === 429 ? "rate_limit_error" : "api_error", `Upstream returned retryable HTTP ${status}.`),
         headers
       );
       return;
@@ -756,7 +714,7 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
     stats.permanentPassed += 1;
   }
 
-  const body = bodyText || JSON.stringify(clientErrorShape(requestUrl, "api_error", `Any Router returned HTTP ${status}.`));
+  const body = bodyText || JSON.stringify(clientErrorShape(requestUrl, "api_error", `Upstream returned HTTP ${status}.`));
   headers["content-length"] = Buffer.byteLength(body);
   res.writeHead(status, headers);
   res.end(body);
@@ -876,7 +834,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
       if (earlyError) {
         finishedEarly = true;
         sendRetryableProxyError(res, requestUrl, earlyError.status, earlyError.message, {
-          "x-anyrouter-proxy-classification": "sse-error-before-first-token"
+          "x-proxy-classification": "sse-error-before-first-token"
         });
         upstreamRes.destroy();
         return;
@@ -886,9 +844,9 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
       stats.droppedSseFrames += 1;
       return;
     }
-    if (isMeaningfulSseFrame(frame)) sawMeaningfulFrame = true;
-    if (!sawMeaningfulFrame && sseFrameData(frame) === "[DONE]") return;
-    if (!sawMeaningfulFrame && !sseFrameData(frame)) return;
+    const data = sseFrameData(frame);
+    if (data && data !== "[DONE]") sawMeaningfulFrame = true;
+    if (!sawMeaningfulFrame) return;
 
     // Gateways pad frames with extra newlines; re-emit exactly one separator so
     // the client always sees well-formed SSE, including on the final frame.
@@ -923,8 +881,8 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
     if (finishedEarly || completed) return;
     if (!sawMeaningfulFrame) {
       stats.emptyStreamsRecovered += 1;
-      sendRetryableProxyError(res, requestUrl, 503, "Any Router returned an empty SSE stream. Retrying is safe.", {
-        "x-anyrouter-proxy-classification": "empty-stream"
+      sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream. Retrying is safe.", {
+        "x-proxy-classification": "empty-stream"
       });
       return;
     }
@@ -936,7 +894,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
     if (completed) return;
     stats.networkErrors += 1;
     if (!started) {
-      sendRetryableProxyError(res, requestUrl, 503, `Any Router stream failed before first event: ${error.message}`);
+      sendRetryableProxyError(res, requestUrl, 503, `Upstream stream failed before first event: ${error.message}`);
     } else {
       res.destroy(error);
     }
@@ -955,7 +913,6 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
     seenUsefulEvent: false
   };
   let buffer = "";
-  let errorBody = "";
   let finalized = false;
 
   const upstream = requestUpstream(req, requestUrl, upstreamBody, true, (upstreamRes) => {
@@ -977,15 +934,15 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
         const isRate = String(state.error.type || "").toLowerCase().includes("rate_limit");
         const isTransient = isRate || transientErrorPatterns.some((pattern) => errorText.includes(pattern));
         if (isTransient) {
-          sendRetryableProxyError(res, requestUrl, isRate ? 429 : 503, state.error.message || "Any Router returned a transient SSE error.");
+          sendRetryableProxyError(res, requestUrl, isRate ? 429 : 503, state.error.message || "Upstream returned a transient SSE error.");
         } else {
-          sendJson(res, 502, clientErrorShape(requestUrl, "api_error", state.error.message || "Any Router stream returned an error."));
+          sendJson(res, 502, clientErrorShape(requestUrl, "api_error", state.error.message || "Upstream stream returned an error."));
         }
         return;
       }
       if (!state.seenUsefulEvent) {
         stats.emptyStreamsRecovered += 1;
-        sendRetryableProxyError(res, requestUrl, 503, "Any Router returned an empty SSE stream while collecting a non-streaming response.");
+        sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream while collecting a non-streaming response.");
         return;
       }
       sendJson(res, 200, buildCollectedAnthropicMessage(state, clientPayload.model));
@@ -994,8 +951,6 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
     upstreamRes.setEncoding("utf8");
     upstreamRes.on("data", (chunk) => {
       if (finalized) return;
-      errorBody += chunk;
-      if (errorBody.length > 2 * 1024 * 1024) errorBody = errorBody.slice(-2 * 1024 * 1024);
       buffer += chunk;
       buffer = parseSseEvents(buffer, (_event, data) => {
         let payload;
@@ -1465,7 +1420,7 @@ function collectResponsesFromChat(req, res, requestUrl, payload, chatPayload, ba
           finishResponsesState(state, baseMessages);
           sendJson(res, 200, responseObject(state));
         } catch (error) {
-          sendNetworkError(res, requestUrl, new Error(`Invalid Chat Completions JSON from Any Router: ${error.message}`));
+          sendNetworkError(res, requestUrl, new Error(`Invalid Chat Completions JSON from upstream: ${error.message}`));
         }
       }).catch((error) => sendNetworkError(res, requestUrl, error));
       return;
@@ -1479,7 +1434,7 @@ function collectResponsesFromChat(req, res, requestUrl, payload, chatPayload, ba
       if (buffer.trim()) buffer = parseChatSse(`${buffer}\n\n`, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk));
       if (!state.textStarted && !state.toolCalls.size) {
         stats.emptyStreamsRecovered += 1;
-        sendRetryableProxyError(res, requestUrl, 503, "Any Router returned an empty Chat Completions stream while bridging Responses.");
+        sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty Chat Completions stream while bridging Responses.");
         return;
       }
       finishResponsesState(state, baseMessages);
@@ -1557,7 +1512,7 @@ function streamResponsesFromChat(req, res, requestUrl, payload, chatPayload, bas
     if (!state.textStarted && !state.toolCalls.size) {
       if (!started) {
         stats.emptyStreamsRecovered += 1;
-        sendRetryableProxyError(res, requestUrl, 503, "Any Router returned an empty Chat Completions stream while bridging Responses.");
+        sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty Chat Completions stream while bridging Responses.");
       } else {
         res.end();
       }
@@ -1627,7 +1582,7 @@ function streamResponsesFromChat(req, res, requestUrl, payload, chatPayload, bas
           }
           complete();
         } catch (error) {
-          if (!started) sendNetworkError(res, requestUrl, new Error(`Invalid Chat Completions JSON from Any Router: ${error.message}`));
+          if (!started) sendNetworkError(res, requestUrl, new Error(`Invalid Chat Completions JSON from upstream: ${error.message}`));
           else res.destroy(error);
         }
       }).catch((error) => started ? res.destroy(error) : sendNetworkError(res, requestUrl, error));
@@ -1666,7 +1621,7 @@ function handleResponsesRequest(req, res, requestUrl, payload) {
 function sendNetworkError(res, requestUrl, error) {
   stats.networkErrors += 1;
   const message = error instanceof Error ? error.message : String(error);
-  sendRetryableProxyError(res, requestUrl, 503, `Any Router connection error: ${message}`);
+  sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
 }
 
 function pipeRequest(req, res, requestUrl, body, wantsStream) {
@@ -1695,8 +1650,8 @@ const server = http.createServer(async (req, res) => {
   const requestId = crypto.randomUUID();
   req._proxyRequestId = requestId;
   stats.requests += 1;
-  res.setHeader("x-anyrouter-proxy-version", proxyVersion);
-  res.setHeader("x-anyrouter-proxy-request-id", requestId);
+  res.setHeader("x-proxy-version", proxyVersion);
+  res.setHeader("x-proxy-request-id", requestId);
 
   res.once("finish", () => log(requestId, "<-CL", `${res.statusCode}`));
 
@@ -1759,11 +1714,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (requestUrl.pathname === "/v1/models" && req.method === "GET") {
-      sendJson(res, 200, modelList());
-      return;
-    }
-
     const allowedPaths = new Set([
       "/v1/messages",
       "/v1/messages/count_tokens",
@@ -1774,7 +1724,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 404, clientErrorShape(
         requestUrl,
         "not_found",
-        "Supported endpoints: POST /v1/messages, POST /v1/messages/count_tokens, POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health."
+        "Supported endpoints: POST /v1/messages, POST /v1/messages/count_tokens, POST /v1/chat/completions, POST /v1/responses, GET /health."
       ));
       return;
     }
@@ -1808,7 +1758,7 @@ server.keepAliveTimeout = 5000;
 server.maxRequestsPerSocket = 1000;
 
 function shutdown(signal) {
-  console.log(`Received ${signal}; shutting down Any Router Local Proxy v${proxyVersion}.`);
+  console.log(`Received ${signal}; shutting down Local API Proxy v${proxyVersion}.`);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5000).unref();
 }
@@ -1817,6 +1767,6 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(port, host, () => {
-  console.log(`Any Router Local Proxy v${proxyVersion} listening on http://${host}:${port} with ${nodeRuntimeVersion}`);
+  console.log(`Local API Proxy v${proxyVersion} listening on http://${host}:${port} with ${nodeRuntimeVersion}`);
   traceInit();
 });

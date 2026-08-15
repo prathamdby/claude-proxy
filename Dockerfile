@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 
 # Node 24.19 is an active LTS line and matches the runtime this proxy was
-# developed against. The exact version is not cosmetic here: process.version is
-# sent upstream as the x-stainless-runtime-version header and is echoed by
-# /health, so changing the base image changes what the gateway sees.
+# developed against. process.version is reported by /health, so changing the
+# base image changes what that endpoint says the proxy is running on. It is not
+# sent upstream: the proxy no longer synthesizes x-stainless-* headers, and a
+# real client's own values were always forwarded in preference anyway.
 # Pinned to a minor tag rather than :latest so rebuilds are reproducible.
 FROM node:24.19-alpine
 
@@ -25,7 +26,7 @@ USER node
 
 # No ENV or ARG config values anywhere in this file, deliberately.
 # The image is identical no matter who builds it and carries no credentials,
-# no hostnames and no defaults. Every one of the 20 settings is supplied at
+# no hostnames and no defaults. Every one of the 17 settings is supplied at
 # run time; proxy.mjs validates them all before it binds a socket and exits 1
 # naming every missing variable at once. Run this image without an env file and
 # it fails immediately and loudly, which is the intended behaviour.
