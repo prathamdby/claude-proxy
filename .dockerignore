@@ -1,0 +1,17 @@
+# Deny everything, then re-admit only the single file the image needs.
+# An allow-list is used rather than a deny-list so that a file added to this
+# directory later cannot silently end up in the build context. In particular
+# .env must never reach the daemon: a build context is uploaded wholesale, and
+# any COPY that touched it would bake the upstream credential into an image
+# layer where `docker history` can read it back out.
+*
+!proxy.mjs
+
+# Belt and braces. These stay excluded even if the allow-list above is widened
+# later, so the two highest-consequence categories -- credentials and trace
+# files containing full prompt text -- cannot be reintroduced by accident.
+.env
+.env.*
+*.log
+*.trace
+.git

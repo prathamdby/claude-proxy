@@ -1,0 +1,144 @@
+# Any Router Local Proxy -- Docker Compose deployment.
+#
+# No top-level `version:` key: it is obsolete in Compose v2+ and now warns.
+#
+# Every setting comes from .env. Copy .env.example to .env and fill it in:
+#
+#   cp .env.example .env
+#   # edit .env and fill in the two keys
+#   docker compose up -d
+#
+# Two independent layers refuse to start on a missing value. Compose itself
+# fails first, via the required-variable interpolation form below, before an
+# image is built or a container is created. If a value slips past that,
+# proxy.mjs validates types and ranges at startup and exits 1 naming every
+# problem at once.
+#
+# Note the ":?" form (not "?"): it rejects an empty value as well as an unset
+# one. That matters because Compose expands an undefined variable to an empty
+# string with only a warning, and an empty PORT would otherwise become 0 and
+# bind a random port.
+
+name: agentrouter-local-proxy
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentrouter-local-proxy:2.1.0
+
+    restart: unless-stopped
+
+    # Insurance rather than a fix: proxy.mjs handles SIGTERM itself and the
+    # Dockerfile uses exec form, so signals already arrive correctly. init:true
+    # keeps that true if a wrapper script is ever introduced.
+    init: true
+
+    # proxy.mjs caps its own graceful shutdown at 5 seconds, so a longer grace
+    # period buys nothing. A stop during an active SSE stream records exit 1.
+    stop_grace_period: 10s
+
+    env_file:
+      - .env
+
+    environment:
+      # HOST is deliberately NOT passed through from .env.
+      #
+      # Inside a container, 127.0.0.1 is the container's own loopback namespace.
+      # Binding it would make the listener unreachable from the host: Docker's
+      # port publisher connects to the container's bridge IP, so `ports:` below
+      # would map to nothing and every request would be refused while the
+      # container looked perfectly healthy and logged that it was listening.
+      # 0.0.0.0 is the only correct bind address in a container, so it is fixed
+      # here where it cannot be got wrong. `environment:` takes precedence over
+      # `env_file:`, so this wins even if HOST is set in .env.
+      #
+      # This is not a public exposure. What is reachable is decided entirely by
+      # the `ports:` publish spec below, which binds host loopback only.
+      HOST: "0.0.0.0"
+
+      # Everything else is passed through and must be present in .env.
+      PORT: "${PORT:?missing in .env - see .env.example}"
+      ANYROUTER_BASE_URL: "${ANYROUTER_BASE_URL:?missing in .env - see .env.example}"
+      ANYROUTER_API_KEY: "${ANYROUTER_API_KEY:?missing in .env - see .env.example}"
+      LOCAL_PROXY_KEY: "${LOCAL_PROXY_KEY:?missing in .env - see .env.example}"
+      CLAUDE_CODE_VERSION: "${CLAUDE_CODE_VERSION:?missing in .env - see .env.example}"
+      ANYROUTER_MODEL: "${ANYROUTER_MODEL:?missing in .env - see .env.example}"
+      UPSTREAM_TIMEOUT_MS: "${UPSTREAM_TIMEOUT_MS:?missing in .env - see .env.example}"
+      RETRY_AFTER_SECONDS: "${RETRY_AFTER_SECONDS:?missing in .env - see .env.example}"
+      MAX_BODY_BYTES: "${MAX_BODY_BYTES:?missing in .env - see .env.example}"
+      ANYROUTER_WIRE_OS: "${ANYROUTER_WIRE_OS:?missing in .env - see .env.example}"
+      ANYROUTER_WIRE_ARCH: "${ANYROUTER_WIRE_ARCH:?missing in .env - see .env.example}"
+      ANYROUTER_STAINLESS_VERSION: "${ANYROUTER_STAINLESS_VERSION:?missing in .env - see .env.example}"
+      RESPONSES_STORE_MAX: "${RESPONSES_STORE_MAX:?missing in .env - see .env.example}"
+      PROXY_LOG: "${PROXY_LOG:?missing in .env - see .env.example}"
+      PROXY_LOG_VERBOSE: "${PROXY_LOG_VERBOSE:?missing in .env - see .env.example}"
+      PROXY_LOG_BODY_LIMIT: "${PROXY_LOG_BODY_LIMIT:?missing in .env - see .env.example}"
+      PROXY_TRACE_FILE: "${PROXY_TRACE_FILE:?missing in .env - see .env.example}"
+      PROXY_TRACE: "${PROXY_TRACE:?missing in .env - see .env.example}"
+      PROXY_TRACE_BODY_LIMIT: "${PROXY_TRACE_BODY_LIMIT:?missing in .env - see .env.example}"
+
+    ports:
+      # The "127.0.0.1:" prefix is the important part. This service holds a
+      # paid upstream credential, and /health is unauthenticated, so it must
+      # not be reachable from the LAN. A bare "18989:18989" would be: Docker
+      # writes its publish rules into the DOCKER iptables chain, which is
+      # traversed BEFORE ufw or firewalld, so a deny-all host firewall does
+      # not protect a bare publish.
+      #
+      # HOST_PORT is the port on your machine; PORT is the port inside the
+      # container. They can differ if 18989 is already taken locally.
+      - "127.0.0.1:${HOST_PORT:?missing in .env - see .env.example}:${PORT:?missing in .env - see .env.example}"
+
+    healthcheck:
+      # The image is node:alpine, which has neither curl nor wget available as
+      # a dependable tool, so node itself makes the request -- it is guaranteed
+      # present and global fetch exists on this Node version.
+      #
+      # Two details that look arbitrary and are not:
+      #   - 127.0.0.1, never $HOST. HOST is 0.0.0.0, which is a bind address,
+      #     not a connect address.
+      #   - a bare "/health" with no query string. The trace bypass in
+      #     proxy.mjs is an exact string match on req.url, so "/health?probe=1"
+      #     would be fully traced and grow the trace file on every interval.
+      #
+      # No shell-style interpolation braces in the command: Compose would
+      # substitute them as one of its own variables, so the port is read at
+      # run time via process.env.PORT instead.
+      #
+      # This is a liveness probe only. `ok` is hardcoded true and the handler
+      # never contacts the gateway, so a healthy container proves the event
+      # loop responds -- NOT that Any Router is reachable or the key is valid.
+      test:
+        - CMD
+        - node
+        - "-e"
+        - "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    # Hardening. The proxy writes nothing except the optional trace file, and
+    # PORT is above 1024, so it needs no capabilities and no writable rootfs.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # The only writable path, and the only place PROXY_TRACE_FILE may point.
+    # Deliberately a tmpfs and not a volume: the trace contains full prompts
+    # and completions, so it is capped at 64 MiB and dies with the container
+    # instead of accumulating on the host. Read a live trace with
+    #   docker compose exec proxy cat /tmp/anyrouter-trace.log
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    # PROXY_LOG writes to stdout and bodies can be large, so bound the log.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,69 @@
+# --- Secrets and environment ---
+.env
+.env.*
+!.env.example
+.envrc
+*.env
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# --- Proxy runtime artifacts (traces contain full user prompts) ---
+*.log
+logs/
+trace/
+traces/
+*.trace
+anyrouter-trace*.log
+proxy-*.log
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.yarn/
+.pnp.*
+.node_repl_history
+
+# --- Process and build output ---
+*.pid
+*.pid.lock
+*.seed
+pids/
+tmp/
+temp/
+coverage/
+.nyc_output/
+dist/
+build/
+
+# --- Docker local overrides (commonly hold real values) ---
+docker-compose.override.yml
+docker-compose.*.local.yml
+
+# --- Editor junk ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# --- OS junk ---
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# --- Local AI tooling state ---
+.claude/settings.local.json
