@@ -26,7 +26,7 @@ USER node
 
 # No ENV or ARG config values anywhere in this file, deliberately.
 # The image is identical no matter who builds it and carries no credentials,
-# no hostnames and no defaults. Every one of the 17 settings is supplied at
+# no hostnames and no defaults. Every one of the 19 settings is supplied at
 # run time; proxy.mjs validates them all before it binds a socket and exits 1
 # naming every missing variable at once. Run this image without an env file and
 # it fails immediately and loudly, which is the intended behaviour.

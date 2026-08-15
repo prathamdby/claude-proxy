@@ -26,7 +26,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local-api-proxy:3.0.0
+    image: local-api-proxy:4.0.0
 
     restart: unless-stopped
 
@@ -54,12 +54,18 @@ services:
       # here where it cannot be got wrong. `environment:` takes precedence over
       # `env_file:`, so this wins even if HOST is set in .env.
       #
-      # This is not a public exposure. What is reachable is decided entirely by
-      # the `ports:` publish spec below, which binds host loopback only.
+      # This is not a public exposure. 0.0.0.0 means every interface the
+      # CONTAINER has, which on a private Docker network is one address nobody
+      # outside that network can dial. What is actually reachable is decided
+      # below and in front: `ports:` publishes to host loopback only, and a
+      # reverse proxy on the Docker network dials PORT directly (see
+      # `expose:`). This line widens neither of those.
       HOST: "0.0.0.0"
 
       # Everything else is passed through and must be present in .env.
       PORT: "${PORT:?missing in .env - see .env.example}"
+      HEALTH_PORT: "${HEALTH_PORT:?missing in .env - see .env.example}"
+      ALLOWED_HOSTS: "${ALLOWED_HOSTS:?missing in .env - see .env.example}"
       UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:?missing in .env - see .env.example}"
       UPSTREAM_API_KEY: "${UPSTREAM_API_KEY:?missing in .env - see .env.example}"
       LOCAL_PROXY_KEY: "${LOCAL_PROXY_KEY:?missing in .env - see .env.example}"
@@ -76,13 +82,28 @@ services:
       PROXY_TRACE: "${PROXY_TRACE:?missing in .env - see .env.example}"
       PROXY_TRACE_BODY_LIMIT: "${PROXY_TRACE_BODY_LIMIT:?missing in .env - see .env.example}"
 
+    # How a reverse proxy in front of this service reaches it. Traefik (under
+    # Dokploy, or any other router sharing the Docker network) connects to the
+    # container's own IP on PORT over that network -- it does not go out to the
+    # host and back in through a published port, which is why `ports:` below
+    # can stay pinned to loopback without cutting off remote clients.
+    #
+    # `expose:` publishes nothing and opens no firewall hole; container-to-
+    # container traffic on a user-defined bridge works with or without it. It
+    # is here as the declaration of which port is the routable one, so the
+    # answer is in the file rather than in someone's memory.
+    #
+    # HEALTH_PORT is deliberately absent. It is bound to the container's own
+    # loopback and is not meant to be routable even from the Docker network.
+    expose:
+      - "${PORT:?missing in .env - see .env.example}"
+
     ports:
       # The "127.0.0.1:" prefix is the important part. This service holds a
-      # paid upstream credential, and /health is unauthenticated, so it must
-      # not be reachable from the LAN. A bare "18989:18989" would be: Docker
-      # writes its publish rules into the DOCKER iptables chain, which is
-      # traversed BEFORE ufw or firewalld, so a deny-all host firewall does
-      # not protect a bare publish.
+      # paid upstream credential, so it must not be reachable from the LAN. A
+      # bare "18989:18989" would be: Docker writes its publish rules into the
+      # DOCKER iptables chain, which is traversed BEFORE ufw or firewalld, so
+      # a deny-all host firewall does not protect a bare publish.
       #
       # HOST_PORT is the port on your machine; PORT is the port inside the
       # container. They can differ if 18989 is already taken locally.
@@ -93,16 +114,25 @@ services:
       # a dependable tool, so node itself makes the request -- it is guaranteed
       # present and global fetch exists on this Node version.
       #
-      # Two details that look arbitrary and are not:
-      #   - 127.0.0.1, never $HOST. HOST is 0.0.0.0, which is a bind address,
-      #     not a connect address.
-      #   - a bare "/health" with no query string. The trace bypass in
-      #     proxy.mjs is an exact string match on req.url, so "/health?probe=1"
-      #     would be fully traced and grow the trace file on every interval.
+      # HEALTH_PORT, not PORT. /health moved off the public port and is now
+      # served only on the container's internal loopback at HEALTH_PORT, so
+      # this is the sole address that answers it. That the probe still works is
+      # the point of the split: this command runs INSIDE the container, which
+      # is exactly the one place that listener is reachable from.
+      #
+      # 127.0.0.1, never $HOST. HOST is 0.0.0.0, which is a bind address, not
+      # a connect address.
+      #
+      # The bare "/health" no longer needs defending. This file used to warn
+      # against a query string, because the trace bypass was an exact string
+      # match on req.url and "/health?probe=1" would be traced on every
+      # interval. The health listener is its own server and never traces, so
+      # that hazard is gone; the URL stays bare because nothing needs adding
+      # to it.
       #
       # No shell-style interpolation braces in the command: Compose would
       # substitute them as one of its own variables, so the port is read at
-      # run time via process.env.PORT instead.
+      # run time via process.env.HEALTH_PORT instead.
       #
       # This is a liveness probe only. `ok` is hardcoded true and the handler
       # never contacts the gateway, so a healthy container proves the event
@@ -111,14 +141,15 @@ services:
         - CMD
         - node
         - "-e"
-        - "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        - "fetch('http://127.0.0.1:'+process.env.HEALTH_PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
 
     # Hardening. The proxy writes nothing except the optional trace file, and
-    # PORT is above 1024, so it needs no capabilities and no writable rootfs.
+    # both PORT and HEALTH_PORT are above 1024, so it needs no capabilities and
+    # no writable rootfs.
     read_only: true
     cap_drop:
       - ALL
