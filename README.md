@@ -17,13 +17,22 @@ Everything is a single file, `proxy.mjs`. There are no dependencies, no
 | POST | `/v1/messages/count_tokens` | public `PORT` | yes |
 | POST | `/v1/chat/completions` | public `PORT` | yes |
 | POST | `/v1/responses` | public `PORT` | yes |
+| GET | `/v1/models` | public `PORT` | yes |
 | GET | `/health` | internal `127.0.0.1:HEALTH_PORT` | **no** |
 
 Authenticated routes require `LOCAL_PROXY_KEY`, presented as
 `Authorization: Bearer <key>`, `x-api-key` or `api-key`.
 
-Anything else under `/v1/` is a 404 — but auth runs first, so an unauthenticated
-request to an unserved `/v1/` path is still a 401.
+Each path answers to the one method listed beside it. Anything else under
+`/v1/` is a 404 — an unserved path and a served one reached by another method
+get the same reply, which lists every route — but auth runs first, so an
+unauthenticated request to either is still a 401.
+
+`/v1/models` is a straight pass-through: the request goes upstream as it
+arrived, pagination query and all, and the gateway's answer comes back byte for
+byte. The catalogue is therefore whatever your `UPSTREAM_API_KEY` can actually
+reach — the proxy keeps no list of its own, and `UPSTREAM_MODEL` appears in the
+result only if the gateway lists it.
 
 The public listener additionally requires an allowed `Host` header and rejects
 anything that looks like a browser; both are 403. See [Security](#security).
@@ -33,7 +42,7 @@ It is served on a second listener bound to `127.0.0.1:HEALTH_PORT`, the
 container's own loopback, which is never published and never routed by Traefik.
 Nothing outside the container can reach it by construction, and that is why it
 needs no auth: reachability is the control, not a credential. It reports `ok`,
-`version` (the proxy's own, `4.0.0`), `node`, `uptime_seconds`, `upstream` and
+`version` (the proxy's own, `4.1.0`), `node`, `uptime_seconds`, `upstream` and
 `stats`. `HEALTH_PORT` must differ from `PORT`.
 
 ## Configuration

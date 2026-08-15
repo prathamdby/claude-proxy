@@ -185,7 +185,7 @@ const host = config.HOST;
 const port = config.PORT;
 const healthPort = config.HEALTH_PORT;
 const allowedHosts = config.ALLOWED_HOSTS;
-const proxyVersion = "4.0.0";
+const proxyVersion = "4.1.0";
 const nodeRuntimeVersion = process.version;
 const upstreamBaseUrl = config.UPSTREAM_BASE_URL;
 const apiKey = config.UPSTREAM_API_KEY;
@@ -471,16 +471,19 @@ function rejectedByHostGuard(req, res, allowedHostnames) {
   return true;
 }
 
-// Every route the proxy serves. All four are POST-only. The 404 text is derived
-// from the same list so the advertised endpoints cannot drift from the served
-// ones.
-const servedPaths = new Set([
-  "/v1/messages",
-  "/v1/messages/count_tokens",
-  "/v1/chat/completions",
-  "/v1/responses"
+// Every route the proxy serves, each with the one method it answers to. The 404
+// text is derived from the same table so the advertised endpoints cannot drift
+// from the served ones, and a served path reached by the wrong method gets that
+// same 404 rather than a 405: the reply says nothing about which half of the
+// pair a prober guessed right.
+const servedRoutes = new Map([
+  ["/v1/messages", "POST"],
+  ["/v1/messages/count_tokens", "POST"],
+  ["/v1/chat/completions", "POST"],
+  ["/v1/responses", "POST"],
+  ["/v1/models", "GET"]
 ]);
-const servedPathsMessage = `Supported endpoints: ${[...servedPaths].map((path) => `POST ${path}`).join(", ")}.`;
+const servedRoutesMessage = `Supported endpoints: ${[...servedRoutes].map(([path, method]) => `${method} ${path}`).join(", ")}.`;
 
 // The two OpenAI-shaped routes; the Anthropic ones use their own error envelope.
 const openAiErrorPaths = new Set(["/v1/chat/completions", "/v1/responses"]);
@@ -887,8 +890,10 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
   res.end(body);
 }
 
-// The single gate every upstream response passes through, so each caller below
-// only ever deals with a response the gateway considers successful.
+// The single gate every chat-route upstream response passes through, so each
+// caller below only ever deals with a response the gateway considers
+// successful. The /v1/models pass-through opts out: the gateway owns the
+// catalogue's errors too.
 function handledUpstreamFailure(res, requestUrl, upstreamRes) {
   if ((upstreamRes.statusCode || 502) < 400) return false;
   collectResponseBody(upstreamRes)
@@ -1712,11 +1717,13 @@ function handleResponsesRequest(req, res, requestUrl, payload) {
   }
 }
 
-function pipeRequest(req, res, requestUrl, body, wantsStream) {
+function pipeRequest(req, res, requestUrl, body, wantsStream, transparent = false) {
   const upstream = requestUpstream(req, requestUrl, body, wantsStream, (upstreamRes) => {
-    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
+    // A transparent route forwards whatever the gateway answered, errors
+    // included: no classification, no rewrite, no SSE sanitation.
+    if (!transparent && handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
 
-    if (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream")) {
+    if (!transparent && (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream"))) {
       filteredStreamingResponse(upstreamRes, res, requestUrl);
       return;
     }
@@ -1790,8 +1797,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method !== "POST" || !servedPaths.has(requestUrl.pathname)) {
-      sendJson(res, 404, clientErrorShape(requestUrl, "not_found", servedPathsMessage));
+    if (servedRoutes.get(requestUrl.pathname) !== req.method) {
+      sendJson(res, 404, clientErrorShape(requestUrl, "not_found", servedRoutesMessage));
+      return;
+    }
+
+    // The catalogue belongs to the gateway. Which models a key can actually
+    // reach is its answer to give, and a list maintained here would be a second
+    // one to keep true, so the request goes up exactly as it arrived — query
+    // string and all — and the reply comes back untouched, errors included: a
+    // gateway 429 or 500 about the catalogue is the gateway's answer too, not
+    // raw material for the classification pipeline the chat routes need. There
+    // is no body on either leg to read, parse or normalise, which is why this
+    // returns before the JSON path below rather than being another branch
+    // inside it.
+    if (requestUrl.pathname === "/v1/models") {
+      trace(requestId, "ROUTE", requestUrl.pathname);
+      pipeRequest(req, res, requestUrl, Buffer.alloc(0), false, true);
       return;
     }
 
