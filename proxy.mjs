@@ -890,8 +890,10 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
   res.end(body);
 }
 
-// The single gate every upstream response passes through, so each caller below
-// only ever deals with a response the gateway considers successful.
+// The single gate every chat-route upstream response passes through, so each
+// caller below only ever deals with a response the gateway considers
+// successful. The /v1/models pass-through opts out: the gateway owns the
+// catalogue's errors too.
 function handledUpstreamFailure(res, requestUrl, upstreamRes) {
   if ((upstreamRes.statusCode || 502) < 400) return false;
   collectResponseBody(upstreamRes)
@@ -1715,11 +1717,13 @@ function handleResponsesRequest(req, res, requestUrl, payload) {
   }
 }
 
-function pipeRequest(req, res, requestUrl, body, wantsStream) {
+function pipeRequest(req, res, requestUrl, body, wantsStream, transparent = false) {
   const upstream = requestUpstream(req, requestUrl, body, wantsStream, (upstreamRes) => {
-    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
+    // A transparent route forwards whatever the gateway answered, errors
+    // included: no classification, no rewrite, no SSE sanitation.
+    if (!transparent && handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
 
-    if (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream")) {
+    if (!transparent && (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream"))) {
       filteredStreamingResponse(upstreamRes, res, requestUrl);
       return;
     }
@@ -1801,12 +1805,15 @@ const server = http.createServer(async (req, res) => {
     // The catalogue belongs to the gateway. Which models a key can actually
     // reach is its answer to give, and a list maintained here would be a second
     // one to keep true, so the request goes up exactly as it arrived — query
-    // string and all — and the reply comes back untouched. There is no body on
-    // either leg to read, parse or normalise, which is why this returns before
-    // the JSON path below rather than being another branch inside it.
+    // string and all — and the reply comes back untouched, errors included: a
+    // gateway 429 or 500 about the catalogue is the gateway's answer too, not
+    // raw material for the classification pipeline the chat routes need. There
+    // is no body on either leg to read, parse or normalise, which is why this
+    // returns before the JSON path below rather than being another branch
+    // inside it.
     if (requestUrl.pathname === "/v1/models") {
       trace(requestId, "ROUTE", requestUrl.pathname);
-      pipeRequest(req, res, requestUrl, Buffer.alloc(0), false);
+      pipeRequest(req, res, requestUrl, Buffer.alloc(0), false, true);
       return;
     }
 

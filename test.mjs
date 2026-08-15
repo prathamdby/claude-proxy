@@ -177,6 +177,21 @@ const upstream = http.createServer((req, res) => {
     }
 
     if (req.url.startsWith("/v1/models")) {
+      if (req.url.includes("force429")) {
+        res.writeHead(429, { "content-type": "application/json", "retry-after": "7" });
+        res.end(JSON.stringify({ error: { type: "rate_limit_error", message: "quota" } }));
+        return;
+      }
+      if (req.url.includes("force500html")) {
+        res.writeHead(500, { "content-type": "text/html" });
+        res.end("<html>gateway exploded</html>");
+        return;
+      }
+      if (req.url.includes("forceempty")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("");
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(upstreamModelCatalogue));
       return;
@@ -362,6 +377,20 @@ try {
   const rejectedBody = await rejected.json();
   assert.equal(rejectedBody.type, "error");
 
+  // The same ordering holds on the new GET route: an unauthenticated
+  // /v1/models is 401, and nothing may leave for the gateway. A 404 here
+  // would mean routing ran before auth and confirmed the route exists.
+  const modelsAuthIndex = captured.length;
+  const modelsNoAuth = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?limit=2`);
+  assert.equal(modelsNoAuth.status, 401);
+  assert.equal(modelsNoAuth.headers.get("www-authenticate"), "Bearer");
+  assert.equal((await modelsNoAuth.json()).error.type, "authentication_error");
+  const modelsWrongKey = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?limit=2`, {
+    headers: { "x-api-key": "not-the-local-key" }
+  });
+  assert.equal(modelsWrongKey.status, 401);
+  assert.equal(captured.length, modelsAuthIndex, "unauthenticated /v1/models reached the gateway");
+
   // /v1/models is forwarded to the gateway and its answer is returned byte for
   // byte. The catalogue is the gateway's -- these ids exist nowhere in the
   // proxy's configuration, so a list assembled locally could not produce them.
@@ -386,6 +415,49 @@ try {
   assert.equal(modelsRequest.headers.authorization, `Bearer ${testApiKey}`);
   assert.notEqual(modelsRequest.headers.authorization, `Bearer ${localKey}`);
   assert.equal(modelsRequest.headers["x-api-key"], undefined);
+
+  // Even a GET that arrives carrying a body is forwarded without one: the
+  // proxy sends Buffer.alloc(0) regardless, and an encoded query crosses
+  // exactly as written. fetch() drops GET bodies, so this uses the raw client.
+  const rawModelsIndex = captured.length;
+  const rawModels = await rawRequest({
+    method: "GET",
+    path: "/v1/models?limit=2&after_id=gateway%20zero",
+    headers: { authorization: `Bearer ${localKey}` },
+    body: '{"x":1}'
+  });
+  assert.equal(rawModels.status, 200);
+  assert.equal(rawModels.text, JSON.stringify(upstreamModelCatalogue));
+  const rawModelsRequest = captured[rawModelsIndex];
+  assert.equal(rawModelsRequest.method, "GET");
+  assert.equal(rawModelsRequest.url, "/v1/models?limit=2&after_id=gateway%20zero");
+  assert.equal(rawModelsRequest.body, "");
+  assert.equal(rawModelsRequest.headers["content-length"], "0");
+  assert.ok(!rawModelsRequest.url.includes("beta=true"), "beta=true belongs to /v1/messages only");
+
+  // The gateway's errors are its own answers too: status, headers and body
+  // cross the proxy unchanged, with no classification and no rewrite.
+  const models429 = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?force429=1`, {
+    headers: { authorization: `Bearer ${localKey}` }
+  });
+  assert.equal(models429.status, 429);
+  assert.equal(models429.headers.get("retry-after"), "7");
+  assert.equal(models429.headers.get("x-proxy-classification"), null);
+  assert.equal(await models429.text(), JSON.stringify({ error: { type: "rate_limit_error", message: "quota" } }));
+
+  const models500 = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?force500html=1`, {
+    headers: { authorization: `Bearer ${localKey}` }
+  });
+  assert.equal(models500.status, 500);
+  assert.match(models500.headers.get("content-type"), /text\/html/);
+  assert.equal(models500.headers.get("x-proxy-classification"), null);
+  assert.equal(await models500.text(), "<html>gateway exploded</html>");
+
+  const modelsEmpty = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?forceempty=1`, {
+    headers: { authorization: `Bearer ${localKey}` }
+  });
+  assert.equal(modelsEmpty.status, 200);
+  assert.equal(await modelsEmpty.text(), "");
 
   // Each path answers to exactly one method, so /v1/models by POST is refused
   // the same way a path that is not served at all is -- one status, one body,
