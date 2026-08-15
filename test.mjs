@@ -668,6 +668,18 @@ try {
   });
   assert.equal(allowedOtherPort.status, 200, `hostname matching must ignore the port: ${allowedOtherPort.text}`);
 
+  // Host matching is case-insensitive: ALLOWED_HOSTS is lowercased at startup
+  // and the request hostname is lowercased before comparison, so an uppercase
+  // Host reaches the same decision -- and the same upstream -- as its lowercase
+  // form. Without this the guard would be a bypass waiting on a capital letter.
+  const uppercaseHost = await rawRequest({
+    method: "POST",
+    path: "/v1/messages",
+    headers: { ...authHeaders, host: "LOCALHOST:9999" },
+    body: guardBody
+  });
+  assert.equal(uppercaseHost.status, 200, `an uppercase allow-listed Host must be served: ${uppercaseHost.text}`);
+
   // Userinfo smuggling: everything before "@" is credentials, so this request is
   // really addressed to evil.com. Parsing the Host instead of splitting it on
   // ":" is what collapses it to the hostname routing would actually use.
@@ -736,6 +748,29 @@ try {
   assert.notEqual(evilNoAuth.status, 401, "the host guard must run before auth, not after");
   assertForbidden(evilNoAuth, "evil.com", "an unauthenticated request from a rejected host");
 
+  // Rejected probes must not grow the trace file: the public server returns
+  // before the trace tap is wired, and the health listener never traces at all.
+  // A prober who can read the trace should learn nothing about which hosts or
+  // browser headers this proxy refuses, so the file size is captured here and
+  // checked unchanged after a burst of rejections on both listeners.
+  const traceSizeBeforeProbes = fs.statSync(traceFilePath).size;
+  assertForbidden(
+    await rawRequest({ method: "POST", path: "/v1/messages", headers: { ...authHeaders, host: "evil.com" }, body: guardBody }),
+    "evil.com",
+    "a host-rejected probe on the public port"
+  );
+  assertForbidden(
+    await rawRequest({ method: "POST", path: "/v1/messages", headers: { ...authHeaders, host: `127.0.0.1:${proxyPort}`, "sec-fetch-site": "cross-site" }, body: guardBody }),
+    "cross-site",
+    "a Sec-Fetch-Site probe on the public port"
+  );
+  assertForbidden(
+    await rawRequest({ path: "/health", port: healthPort, headers: { host: "evil.com" } }),
+    "evil.com",
+    "a host-rejected probe on the health port"
+  );
+  assert.equal(fs.statSync(traceFilePath).size, traceSizeBeforeProbes, "host-rejected requests left trace file entries");
+
   // -------------------------------------------------------------------------
   // Health moved off the public port onto its own loopback-only listener.
   // -------------------------------------------------------------------------
@@ -767,6 +802,34 @@ try {
   const healthPost = await rawRequest({ method: "POST", path: "/health", port: healthPort, body: {} });
   assert.equal(healthPost.status, 404);
   assert.equal(JSON.parse(healthPost.text).error.type, "not_found");
+
+  // The listener answers exactly GET /health. A trailing slash, an extra path
+  // segment, or a non-GET method all fall through to the same 404 every other
+  // unserved target gets, so nothing about the health endpoint leaks through a
+  // near-miss. HEAD is checked by status only: Node sends no body for HEAD, so
+  // parsing one would assert against an empty string.
+  const healthHead = await rawRequest({ method: "HEAD", path: "/health", port: healthPort });
+  assert.equal(healthHead.status, 404, "HEAD /health must not be served");
+  const healthTrailingSlash = await rawRequest({ path: "/health/", port: healthPort });
+  assert.equal(healthTrailingSlash.status, 404);
+  assert.equal(JSON.parse(healthTrailingSlash.text).error.type, "not_found");
+  const healthExtra = await rawRequest({ path: "/health/extra", port: healthPort });
+  assert.equal(healthExtra.status, 404);
+  assert.equal(JSON.parse(healthExtra.text).error.type, "not_found");
+  // A query string of any length is ignored, not just a single key=value pair,
+  // so Docker's HEALTHCHECK can write the target however it likes.
+  const healthMultiQuery = await fetch(`http://127.0.0.1:${healthPort}/health?probe=1&x=2`);
+  assert.equal(healthMultiQuery.status, 200);
+  assert.equal((await healthMultiQuery.json()).ok, true);
+
+  // IPv6 loopback is bracketed in loopbackHosts because that is the form
+  // new URL() produces for an IPv6 authority, and matching runs on its output.
+  // A health probe that arrives with a bracketed IPv6 Host -- with or without a
+  // port -- is accepted, pinning the bracket handling against a future drift.
+  const ipv6Health = await rawRequest({ path: "/health", port: healthPort, headers: { host: "[::1]" } });
+  assert.equal(ipv6Health.status, 200, `a bracketed IPv6 loopback Host must be served on the health port: ${ipv6Health.text}`);
+  const ipv6HealthPort = await rawRequest({ path: "/health", port: healthPort, headers: { host: `[::1]:${healthPort}` } });
+  assert.equal(ipv6HealthPort.status, 200, `a bracketed IPv6 loopback Host with a port must be served on the health port: ${ipv6HealthPort.text}`);
 
   // Health carries no credentials at all, which is only safe because the socket
   // is bound to 127.0.0.1 rather than to HOST: on 0.0.0.0 this would publish
@@ -855,6 +918,13 @@ try {
   assert.equal(traceMode, 0o600, `trace file mode is 0${traceMode.toString(8)}, expected 0600`);
 
   const traceText = fs.readFileSync(traceFilePath, "utf8");
+
+  // Rejected Host and browser-header values never reach the trace: the guard
+  // returns before the trace tap is wired on the public server, and the health
+  // listener never traces. A prober cannot read back what was refused.
+  assert.ok(!traceText.includes("evil.com"), "a rejected Host value leaked into the trace");
+  assert.ok(!traceText.includes("evil.example"), "a rejected Origin value leaked into the trace");
+  assert.ok(!traceText.includes("cross-site"), "a rejected Sec-Fetch-Site value leaked into the trace");
 
   // The markers prove redaction actually ran on both legs. Without them, the
   // absence assertions below would also pass on an empty or truncated file.
