@@ -340,8 +340,22 @@ function sendJson(res, status, value, extraHeaders = {}) {
   res.end(body);
 }
 
+// Every route the proxy serves. All four are POST-only; /health is answered
+// before authentication and is not in the table. The 404 text is derived from
+// the same list so the advertised endpoints cannot drift from the served ones.
+const servedPaths = new Set([
+  "/v1/messages",
+  "/v1/messages/count_tokens",
+  "/v1/chat/completions",
+  "/v1/responses"
+]);
+const servedPathsMessage = `Supported endpoints: ${[...servedPaths].map((path) => `POST ${path}`).join(", ")}, GET /health.`;
+
+// The two OpenAI-shaped routes; the Anthropic ones use their own error envelope.
+const openAiErrorPaths = new Set(["/v1/chat/completions", "/v1/responses"]);
+
 function clientErrorShape(requestUrl, type, message, code = undefined) {
-  if (["/v1/chat/completions", "/v1/responses"].includes(requestUrl?.pathname)) {
+  if (openAiErrorPaths.has(requestUrl?.pathname)) {
     return { error: { message, type, ...(code ? { code } : {}) } };
   }
   return { type: "error", error: { type, message } };
@@ -403,10 +417,16 @@ function sessionId(sourceHeaders) {
   return uuidPattern.test(incoming) ? incoming : crypto.randomUUID();
 }
 
-// Hop-by-hop headers plus the ones the proxy must own on the upstream request.
-const requestHeadersProxyOwns = new Set([
+// Connection-scoped headers: meaningful for one hop only, so they are dropped
+// in both directions rather than copied onto the next connection.
+const hopByHopHeaders = [
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-  "proxy-connection", "trailer", "te", "transfer-encoding", "upgrade",
+  "proxy-connection", "trailer", "te", "transfer-encoding", "upgrade"
+];
+
+// Hop-by-hop plus the ones the proxy must own on the upstream request.
+const requestHeadersProxyOwns = new Set([
+  ...hopByHopHeaders,
   "host", "content-length", "accept-encoding",
   "authorization", "x-api-key", "api-key"
 ]);
@@ -509,13 +529,8 @@ function requestUpstream(req, requestUrl, body, wantsStream, onResponse, pathnam
 
 function stripHopByHopHeaders(source) {
   const headers = { ...source };
-  for (const name of [
-    "connection", "content-length", "transfer-encoding", "keep-alive",
-    "proxy-authenticate", "proxy-authorization", "proxy-connection",
-    "trailer", "te", "upgrade"
-  ]) {
-    delete headers[name];
-  }
+  // content-length goes too: the body is re-framed on the way out.
+  for (const name of [...hopByHopHeaders, "content-length"]) delete headers[name];
   return headers;
 }
 
@@ -552,52 +567,67 @@ function shouldDropSseFrame(frame) {
   }
 }
 
+const transientSseErrorMessage = "Upstream returned a transient SSE error.";
+
+// One rule for an `error` event arriving inside a 200 SSE stream, shared by the
+// pass-through path and the collecting path so the same gateway failure gets the
+// same status whether or not the client asked for a stream. null means the error
+// is the gateway's final word and must not be dressed up as retryable.
+function sseErrorStatus(error, fallbackType = "") {
+  const type = String(error?.type || fallbackType).toLowerCase();
+  const text = `${type} ${String(error?.message || "")}`.toLowerCase();
+  if (type.includes("rate_limit")) return 429;
+  if (transientErrorPatterns.some((pattern) => text.includes(pattern))) return 503;
+  if (type.includes("overloaded") || type.includes("unavailable")) return 503;
+  return null;
+}
 
 function sseErrorInfo(frame) {
   const data = sseFrameData(frame);
   if (!data || data === "[DONE]") return null;
+  let payload;
   try {
-    const payload = JSON.parse(data);
-    if (!payload || typeof payload !== "object" || !payload.error) return null;
-    const error = payload.error;
-    const type = String(error.type || payload.type || "").toLowerCase();
-    const message = String(error.message || "");
-    const text = `${type} ${message}`.toLowerCase();
-    if (type.includes("rate_limit") || transientErrorPatterns.some((pattern) => text.includes(pattern))) {
-      return { status: type.includes("rate_limit") ? 429 : 503, message: message || "Upstream returned a transient SSE error." };
-    }
-    if (type.includes("overloaded") || type.includes("unavailable")) {
-      return { status: 503, message: message || "Upstream is temporarily unavailable." };
-    }
+    payload = JSON.parse(data);
   } catch {
     return null;
   }
-  return null;
+  if (!payload?.error) return null;
+  const status = sseErrorStatus(payload.error, payload.type);
+  return status ? { status, message: payload.error.message || transientSseErrorMessage } : null;
 }
 
-function parseSseEvents(buffer, onEvent) {
+// Consumes whole frames from `buffer` and returns the unconsumed tail.
+function eachSseFrame(buffer, onFrame) {
   while (true) {
     const separator = buffer.match(/\r?\n\r?\n/);
-    if (!separator || separator.index === undefined) return buffer;
+    if (!separator) return buffer;
     const frame = buffer.slice(0, separator.index);
     buffer = buffer.slice(separator.index + separator[0].length);
-    if (shouldDropSseFrame(frame)) {
-      stats.droppedSseFrames += 1;
-      continue;
-    }
-
-    let event = "message";
-    const dataLines = [];
-    for (const line of frame.split(/\r?\n/)) {
-      if (line.startsWith("event:")) event = line.slice(6).trim();
-      if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
-    }
-    const data = dataLines.join("\n");
-    if (data && data !== "[DONE]") onEvent(event, data);
+    onFrame(frame);
   }
 }
 
-function collectResponseBody(upstreamRes, limit = 2 * 1024 * 1024) {
+// Frames that carry a JSON object, with gateway noise already dropped. Every
+// consumer wants the parsed payload, so nothing downstream re-checks the shape.
+function parseSseEvents(buffer, onPayload) {
+  return eachSseFrame(buffer, (frame) => {
+    if (shouldDropSseFrame(frame)) {
+      stats.droppedSseFrames += 1;
+      return;
+    }
+    const data = sseFrameData(frame);
+    if (!data || data === "[DONE]") return;
+    try {
+      const payload = JSON.parse(data);
+      if (payload && typeof payload === "object") onPayload(payload);
+    } catch {
+      // Ignore malformed vendor extension frames.
+    }
+  });
+}
+
+function collectResponseBody(upstreamRes) {
+  const limit = 2 * 1024 * 1024;
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -667,6 +697,12 @@ function sendRetryableProxyError(res, requestUrl, status, message, extraHeaders 
   );
 }
 
+function sendNetworkError(res, requestUrl, error) {
+  stats.networkErrors += 1;
+  const message = error instanceof Error ? error.message : String(error);
+  sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
+}
+
 function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
   const status = upstreamRes.statusCode || 502;
   const classification = errorClassification(status, bodyText);
@@ -720,6 +756,16 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
   res.end(body);
 }
 
+// The single gate every upstream response passes through, so each caller below
+// only ever deals with a response the gateway considers successful.
+function handledUpstreamFailure(res, requestUrl, upstreamRes) {
+  if ((upstreamRes.statusCode || 502) < 400) return false;
+  collectResponseBody(upstreamRes)
+    .then((bodyText) => sendUpstreamError(res, requestUrl, upstreamRes, bodyText))
+    .catch((error) => sendNetworkError(res, requestUrl, error));
+  return true;
+}
+
 function applyAnthropicSsePayload(state, payload) {
   switch (payload.type) {
     case "message_start":
@@ -766,12 +812,12 @@ function applyAnthropicSsePayload(state, payload) {
 }
 
 function finalizeBlock(block) {
-  if (!block || block.type !== "tool_use" || typeof block.partial_json !== "string") return block;
+  if (!block || block.type !== "tool_use" || typeof block.partial_json !== "string") return;
   const partial = block.partial_json;
   delete block.partial_json;
   if (!partial.trim()) {
     if (block.input === undefined) block.input = {};
-    return block;
+    return;
   }
   try {
     block.input = JSON.parse(partial);
@@ -779,7 +825,6 @@ function finalizeBlock(block) {
     block.input = block.input ?? {};
     block._proxy_partial_json = partial;
   }
-  return block;
 }
 
 function buildCollectedAnthropicMessage(state, requestedModel) {
@@ -817,8 +862,9 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
   let buffer = "";
   let started = false;
   let sawMeaningfulFrame = false;
-  let finishedEarly = false;
-  let completed = false;
+  // The client has been answered in full; nothing more may be written to it,
+  // whether that was an early error, a terminal frame or a socket failure.
+  let finished = false;
   upstreamRes.setEncoding("utf8");
 
   function startResponse() {
@@ -828,11 +874,11 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
   }
 
   function handleFrame(frame) {
-    if (finishedEarly || completed) return;
+    if (finished) return;
     if (!started) {
       const earlyError = sseErrorInfo(frame);
       if (earlyError) {
-        finishedEarly = true;
+        finished = true;
         sendRetryableProxyError(res, requestUrl, earlyError.status, earlyError.message, {
           "x-proxy-classification": "sse-error-before-first-token"
         });
@@ -857,7 +903,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
     res.write(`${normalized}\n\n`);
 
     if (isTerminalSseFrame(normalized)) {
-      completed = true;
+      finished = true;
       stats.streamsClosedOnTerminalFrame += 1;
       res.end();
       upstreamRes.destroy();
@@ -865,20 +911,13 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
   }
 
   upstreamRes.on("data", (chunk) => {
-    buffer += chunk;
-    while (true) {
-      const separator = buffer.match(/\r?\n\r?\n/);
-      if (!separator || separator.index === undefined) break;
-      const frame = buffer.slice(0, separator.index);
-      buffer = buffer.slice(separator.index + separator[0].length);
-      handleFrame(frame);
-    }
+    buffer = eachSseFrame(buffer + chunk, handleFrame);
   });
 
   upstreamRes.on("end", () => {
-    if (finishedEarly || completed) return;
+    if (finished) return;
     if (buffer) handleFrame(buffer);
-    if (finishedEarly || completed) return;
+    if (finished) return;
     if (!sawMeaningfulFrame) {
       stats.emptyStreamsRecovered += 1;
       sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream. Retrying is safe.", {
@@ -891,7 +930,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
   });
 
   upstreamRes.on("error", (error) => {
-    if (completed) return;
+    if (finished) return;
     stats.networkErrors += 1;
     if (!started) {
       sendRetryableProxyError(res, requestUrl, 503, `Upstream stream failed before first event: ${error.message}`);
@@ -916,13 +955,7 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
   let finalized = false;
 
   const upstream = requestUpstream(req, requestUrl, upstreamBody, true, (upstreamRes) => {
-    const status = upstreamRes.statusCode || 502;
-    if (status >= 400) {
-      collectResponseBody(upstreamRes)
-        .then((bodyText) => sendUpstreamError(res, requestUrl, upstreamRes, bodyText))
-        .catch((error) => sendNetworkError(res, requestUrl, error));
-      return;
-    }
+    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
 
     // Reply as soon as the message is complete. Waiting for the upstream socket
     // to close adds the gateway's full keep-alive idle timeout to every call.
@@ -930,13 +963,12 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
       if (finalized) return;
       finalized = true;
       if (state.error) {
-        const errorText = JSON.stringify(state.error).toLowerCase();
-        const isRate = String(state.error.type || "").toLowerCase().includes("rate_limit");
-        const isTransient = isRate || transientErrorPatterns.some((pattern) => errorText.includes(pattern));
-        if (isTransient) {
-          sendRetryableProxyError(res, requestUrl, isRate ? 429 : 503, state.error.message || "Upstream returned a transient SSE error.");
+        const status = sseErrorStatus(state.error);
+        const message = state.error.message;
+        if (status) {
+          sendRetryableProxyError(res, requestUrl, status, message || transientSseErrorMessage);
         } else {
-          sendJson(res, 502, clientErrorShape(requestUrl, "api_error", state.error.message || "Upstream stream returned an error."));
+          sendJson(res, 502, clientErrorShape(requestUrl, "api_error", message || "Upstream stream returned an error."));
         }
         return;
       }
@@ -951,16 +983,9 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
     upstreamRes.setEncoding("utf8");
     upstreamRes.on("data", (chunk) => {
       if (finalized) return;
-      buffer += chunk;
-      buffer = parseSseEvents(buffer, (_event, data) => {
-        let payload;
-        try {
-          payload = JSON.parse(data);
-        } catch {
-          return; // Ignore non-JSON extensions; valid Anthropic events are still collected.
-        }
+      buffer = parseSseEvents(buffer + chunk, (payload) => {
         applyAnthropicSsePayload(state, payload);
-        if (payload?.type === "message_stop") {
+        if (payload.type === "message_stop") {
           stats.streamsClosedOnTerminalFrame += 1;
           finalize();
           upstreamRes.destroy();
@@ -969,15 +994,7 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
     });
     upstreamRes.on("end", () => {
       if (finalized) return;
-      if (buffer.trim()) {
-        buffer = parseSseEvents(`${buffer}\n\n`, (_event, data) => {
-          try {
-            applyAnthropicSsePayload(state, JSON.parse(data));
-          } catch {
-            // Ignore non-JSON extensions.
-          }
-        });
-      }
+      if (buffer.trim()) parseSseEvents(`${buffer}\n\n`, (payload) => applyAnthropicSsePayload(state, payload));
       finalize();
     });
     upstreamRes.on("error", (error) => {
@@ -989,29 +1006,6 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
     if (finalized) return;
     sendNetworkError(res, requestUrl, error);
   });
-}
-
-
-function responseTextContent(content) {
-  if (typeof content === "string") return content;
-  if (content === null || content === undefined) return "";
-  if (!Array.isArray(content)) return String(content);
-  const parts = [];
-  for (const part of content) {
-    if (typeof part === "string") {
-      parts.push(part);
-      continue;
-    }
-    if (!part || typeof part !== "object") continue;
-    if (["input_text", "output_text", "text"].includes(part.type) && typeof part.text === "string") {
-      parts.push(part.text);
-      continue;
-    }
-    if (part.type === "refusal" && typeof part.refusal === "string") {
-      parts.push(part.refusal);
-    }
-  }
-  return parts.join("");
 }
 
 function responseContentToChat(content, role) {
@@ -1202,7 +1196,7 @@ function responsesRequestToChat(payload) {
   if (toolChoice !== undefined) chat.tool_choice = toolChoice;
   const responseFormat = responseTextFormatToChat(payload.text);
   if (responseFormat !== undefined) chat.response_format = responseFormat;
-  return { chat, messages, contextMessages };
+  return { chat, contextMessages };
 }
 
 function newResponsesState(payload) {
@@ -1212,7 +1206,6 @@ function newResponsesState(payload) {
     completedAt: null,
     model: payload.model || defaultModel,
     payload,
-    chatId: null,
     text: "",
     textItemId: `msg_${crypto.randomUUID().replaceAll("-", "")}`,
     textOutputIndex: null,
@@ -1319,8 +1312,6 @@ function assistantChatMessageFromState(state) {
 }
 
 function applyChatChunkToResponsesState(state, chunk, callbacks = {}) {
-  if (!chunk || typeof chunk !== "object") return;
-  if (chunk.id) state.chatId = chunk.id;
   if (chunk.model) state.model = chunk.model;
   if (chunk.usage) state.usage = chunk.usage;
   const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : null;
@@ -1365,15 +1356,22 @@ function applyChatChunkToResponsesState(state, chunk, callbacks = {}) {
   }
 }
 
-function parseChatSse(buffer, onChunk) {
-  return parseSseEvents(buffer, (_event, data) => {
-    try {
-      const payload = JSON.parse(data);
-      if (payload && typeof payload === "object" && !shouldDropSseFrame(`data: ${data}`)) onChunk(payload);
-    } catch {
-      // Ignore malformed vendor extension frames.
-    }
-  });
+// A gateway that ignores `stream: true` answers with one whole Chat Completions
+// object instead. Replay it through the same delta path so both wire shapes end
+// up in an identical Responses state.
+function applyChatCompletionToResponsesState(state, completion, callbacks) {
+  state.model = completion.model || state.model;
+  state.usage = completion.usage || null;
+  const choice = completion.choices?.[0] || {};
+  state.finishReason = choice.finish_reason || "stop";
+  const message = choice.message || {};
+  if (typeof message.content === "string" && message.content) {
+    applyChatChunkToResponsesState(state, { choices: [{ delta: { content: message.content } }] }, callbacks);
+  }
+  if (Array.isArray(message.tool_calls)) {
+    const toolCalls = message.tool_calls.map((call, index) => ({ ...call, index }));
+    applyChatChunkToResponsesState(state, { choices: [{ delta: { tool_calls: toolCalls } }] }, callbacks);
+  }
 }
 
 function writeResponsesEvent(res, state, type, fields = {}) {
@@ -1393,30 +1391,12 @@ function collectResponsesFromChat(req, res, requestUrl, payload, chatPayload, ba
   const body = Buffer.from(JSON.stringify(chatPayload));
   let buffer = "";
   const upstream = requestUpstream(req, requestUrl, body, true, (upstreamRes) => {
-    const status = upstreamRes.statusCode || 502;
-    if (status >= 400) {
-      collectResponseBody(upstreamRes)
-        .then((bodyText) => sendUpstreamError(res, requestUrl, upstreamRes, bodyText))
-        .catch((error) => sendNetworkError(res, requestUrl, error));
-      return;
-    }
+    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
     const contentType = String(upstreamRes.headers["content-type"] || "");
     if (!contentType.includes("text/event-stream")) {
       collectResponseBody(upstreamRes).then((text) => {
         try {
-          const completion = JSON.parse(text);
-          state.chatId = completion.id || null;
-          state.model = completion.model || state.model;
-          state.usage = completion.usage || null;
-          const choice = completion.choices?.[0] || {};
-          state.finishReason = choice.finish_reason || "stop";
-          const message = choice.message || {};
-          if (typeof message.content === "string" && message.content) {
-            applyChatChunkToResponsesState(state, { choices: [{ delta: { content: message.content } }] });
-          }
-          if (Array.isArray(message.tool_calls)) {
-            applyChatChunkToResponsesState(state, { choices: [{ delta: { tool_calls: message.tool_calls.map((call, index) => ({ ...call, index })) } }] });
-          }
+          applyChatCompletionToResponsesState(state, JSON.parse(text));
           finishResponsesState(state, baseMessages);
           sendJson(res, 200, responseObject(state));
         } catch (error) {
@@ -1427,11 +1407,10 @@ function collectResponsesFromChat(req, res, requestUrl, payload, chatPayload, ba
     }
     upstreamRes.setEncoding("utf8");
     upstreamRes.on("data", (chunk) => {
-      buffer += chunk;
-      buffer = parseChatSse(buffer, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk));
+      buffer = parseSseEvents(buffer + chunk, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk));
     });
     upstreamRes.on("end", () => {
-      if (buffer.trim()) buffer = parseChatSse(`${buffer}\n\n`, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk));
+      if (buffer.trim()) parseSseEvents(`${buffer}\n\n`, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk));
       if (!state.textStarted && !state.toolCalls.size) {
         stats.emptyStreamsRecovered += 1;
         sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty Chat Completions stream while bridging Responses.");
@@ -1556,30 +1535,15 @@ function streamResponsesFromChat(req, res, requestUrl, payload, chatPayload, bas
     res.end();
   }
 
+  const streamCallbacks = { onTextStart, onTextDelta, onToolStart, onToolDelta };
+
   const upstream = requestUpstream(req, requestUrl, body, true, (upstreamRes) => {
-    const status = upstreamRes.statusCode || 502;
-    if (status >= 400) {
-      collectResponseBody(upstreamRes)
-        .then((bodyText) => sendUpstreamError(res, requestUrl, upstreamRes, bodyText))
-        .catch((error) => sendNetworkError(res, requestUrl, error));
-      return;
-    }
+    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
     const contentType = String(upstreamRes.headers["content-type"] || "");
     if (!contentType.includes("text/event-stream")) {
       collectResponseBody(upstreamRes).then((text) => {
         try {
-          const completion = JSON.parse(text);
-          state.model = completion.model || state.model;
-          state.usage = completion.usage || null;
-          const choice = completion.choices?.[0] || {};
-          state.finishReason = choice.finish_reason || "stop";
-          const message = choice.message || {};
-          if (typeof message.content === "string" && message.content) {
-            applyChatChunkToResponsesState(state, { choices: [{ delta: { content: message.content } }] }, { onTextStart, onTextDelta });
-          }
-          if (Array.isArray(message.tool_calls)) {
-            applyChatChunkToResponsesState(state, { choices: [{ delta: { tool_calls: message.tool_calls.map((call, index) => ({ ...call, index })) } }] }, { onToolStart, onToolDelta });
-          }
+          applyChatCompletionToResponsesState(state, JSON.parse(text), streamCallbacks);
           complete();
         } catch (error) {
           if (!started) sendNetworkError(res, requestUrl, new Error(`Invalid Chat Completions JSON from upstream: ${error.message}`));
@@ -1590,11 +1554,10 @@ function streamResponsesFromChat(req, res, requestUrl, payload, chatPayload, bas
     }
     upstreamRes.setEncoding("utf8");
     upstreamRes.on("data", (chunk) => {
-      buffer += chunk;
-      buffer = parseChatSse(buffer, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk, { onTextStart, onTextDelta, onToolStart, onToolDelta }));
+      buffer = parseSseEvents(buffer + chunk, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk, streamCallbacks));
     });
     upstreamRes.on("end", () => {
-      if (buffer.trim()) buffer = parseChatSse(`${buffer}\n\n`, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk, { onTextStart, onTextDelta, onToolStart, onToolDelta }));
+      if (buffer.trim()) parseSseEvents(`${buffer}\n\n`, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk, streamCallbacks));
       complete();
     });
     upstreamRes.on("error", (error) => {
@@ -1618,28 +1581,16 @@ function handleResponsesRequest(req, res, requestUrl, payload) {
   }
 }
 
-function sendNetworkError(res, requestUrl, error) {
-  stats.networkErrors += 1;
-  const message = error instanceof Error ? error.message : String(error);
-  sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
-}
-
 function pipeRequest(req, res, requestUrl, body, wantsStream) {
   const upstream = requestUpstream(req, requestUrl, body, wantsStream, (upstreamRes) => {
-    const status = upstreamRes.statusCode || 502;
-    if (status >= 400) {
-      collectResponseBody(upstreamRes)
-        .then((bodyText) => sendUpstreamError(res, requestUrl, upstreamRes, bodyText))
-        .catch((error) => sendNetworkError(res, requestUrl, error));
-      return;
-    }
+    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
 
     if (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream")) {
       filteredStreamingResponse(upstreamRes, res, requestUrl);
       return;
     }
 
-    res.writeHead(status, stripHopByHopHeaders(upstreamRes.headers));
+    res.writeHead(upstreamRes.statusCode, stripHopByHopHeaders(upstreamRes.headers));
     upstreamRes.pipe(res);
     upstreamRes.on("error", (error) => res.destroy(error));
   });
@@ -1714,18 +1665,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const allowedPaths = new Set([
-      "/v1/messages",
-      "/v1/messages/count_tokens",
-      "/v1/chat/completions",
-      "/v1/responses"
-    ]);
-    if (req.method !== "POST" || !allowedPaths.has(requestUrl.pathname)) {
-      sendJson(res, 404, clientErrorShape(
-        requestUrl,
-        "not_found",
-        "Supported endpoints: POST /v1/messages, POST /v1/messages/count_tokens, POST /v1/chat/completions, POST /v1/responses, GET /health."
-      ));
+    if (req.method !== "POST" || !servedPaths.has(requestUrl.pathname)) {
+      sendJson(res, 404, clientErrorShape(requestUrl, "not_found", servedPathsMessage));
       return;
     }
 

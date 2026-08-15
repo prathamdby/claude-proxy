@@ -125,6 +125,11 @@ const upstream = http.createServer((req, res) => {
           res.writeHead(200, { "content-type": "text/event-stream" });
           res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"provider overloaded"}}\n\n');
           return;
+        case "test-sse-error-typed":
+          // Transient only by its error type; the message matches no known phrase.
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"pick a different model"}}\n\n');
+          return;
         case "test-tool":
           writeAnthropicToolStream(res);
           return;
@@ -222,7 +227,7 @@ async function post(path, payload, extraHeaders = {}) {
 }
 
 // fetch() always attaches its own User-Agent, so a truly bare client needs the
-// raw http client. This is the only caller the surviving header defaults serve.
+// raw http client. This is the only caller the header defaults serve.
 function postWithoutUserAgent(path, payload) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
@@ -281,14 +286,15 @@ try {
   await waitForProxy();
 
   // Local API auth is enforced, and it runs before routing: an unauthenticated
-  // call to a path the proxy no longer serves is still 401, not 404.
+  // call to a path the proxy does not serve is still 401, not 404.
   const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/models`);
   assert.equal(rejected.status, 401);
   const rejectedBody = await rejected.json();
   assert.equal(rejectedBody.type, "error");
 
-  // /v1/models is gone -- the proxy has no way to know what the gateway serves,
-  // so it no longer invents a catalogue.
+  // The proxy cannot know which models the gateway carries, so it never invents
+  // a catalogue: /v1/models is an ordinary 404. The 404 text is generated from
+  // the route table, so it can only ever name paths that are actually served.
   const modelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/v1/models`, {
     headers: { authorization: `Bearer ${localKey}` }
   });
@@ -296,6 +302,9 @@ try {
   const modelsBody = await modelsResponse.json();
   assert.equal(modelsBody.error.type, "not_found");
   assert.doesNotMatch(modelsBody.error.message, /v1\/models/);
+  for (const path of ["/v1/messages", "/v1/messages/count_tokens", "/v1/chat/completions", "/v1/responses"]) {
+    assert.ok(modelsBody.error.message.includes(`POST ${path}`), `404 text must name ${path}`);
+  }
 
   // Streaming + SSE sanitation + beta merge + session preservation.
   const streamedAnthropic = await post("/v1/messages", {
@@ -535,6 +544,22 @@ try {
   assert.equal(sseError.status, 503);
   assert.match(sseErrorJson.error.message, /overloaded/i);
 
+  // The same SSE error is classified the same way when the client did not ask
+  // for a stream. The proxy is collecting the gateway's stream on its behalf, so
+  // both paths run one shared rule instead of two that can drift apart -- here
+  // the only transient signal is the error type, not any phrase in the message.
+  for (const stream of [true, false]) {
+    const typedSseError = await post("/v1/messages", {
+      model: "test-sse-error-typed",
+      max_tokens: 8,
+      stream,
+      messages: [{ role: "user", content: "x" }]
+    });
+    const typedSseErrorJson = await typedSseError.json();
+    assert.equal(typedSseError.status, 503, `overloaded_error must be retryable with stream=${stream}`);
+    assert.equal(typedSseErrorJson.error.message, "pick a different model");
+  }
+
   // Anthropic token-count passthrough.
   const tokenCount = await post("/v1/messages/count_tokens", {
     model: "claude-opus-4-8",
@@ -572,19 +597,19 @@ try {
   assert.equal(first.headers["x-api-key"], undefined);
   assert.equal(first.headers.host, `127.0.0.1:${upstreamPort}`);
 
-  // Client headers are forwarded verbatim rather than stripped. The proxy no
-  // longer synthesizes an SDK fingerprint, so these are the client's own values.
+  // Client headers are forwarded verbatim rather than stripped: the gateway sees
+  // the caller's own identity, never one synthesized on its behalf.
   assert.equal(first.headers["user-agent"], "claude-cli/2.1.233 (external, cli)");
   assert.equal(first.headers["x-stainless-retry-count"], "0");
   assert.equal(first.headers["x-stainless-timeout"], "60");
   assert.equal(first.headers["x-custom-client-header"], "forward-me");
 
-  // The only defaults left are the two a bare curl needs to reach the gateway.
+  // For a client that sent its own identity, the only headers filled in are the
+  // two the gateway requires before it will answer at all.
   assert.equal(first.headers["anthropic-version"], "2023-06-01");
   assert.equal(first.headers["content-type"], "application/json");
 
-  // Fabricated os/arch/package-version are gone: nothing invents them when the
-  // client did not send them.
+  // Nothing is invented for headers the client did not send.
   assert.equal(first.headers["x-stainless-os"], undefined);
   assert.equal(first.headers["x-stainless-arch"], undefined);
   assert.equal(first.headers["x-stainless-package-version"], undefined);
