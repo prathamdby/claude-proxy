@@ -1,10 +1,11 @@
 # Local API Proxy
 
-A small, zero-dependency Node.js HTTP proxy that sits between Claude Code and an
-Anthropic-API-compatible gateway. Claude Code talks to this proxy — on localhost,
-or over a public hostname behind Traefik, which is how it is deployed — and the
+A small, zero-dependency Node.js HTTP proxy that sits between Claude Code and a
+gateway that speaks both Anthropic and OpenAI under `/v1`. Claude Code talks to
+this proxy on localhost, or over a public hostname behind Traefik, and the
 proxy attaches the upstream credential, normalises the request and forwards it
-on.
+on. The client path is the upstream path. `/v1/messages` is Anthropic. The
+other served paths are OpenAI, including `/v1/responses`.
 
 Everything is a single file, `proxy.mjs`. There are no dependencies, no
 `package.json` and nothing to install.
@@ -31,8 +32,12 @@ unauthenticated request to either is still a 401.
 `/v1/models` is a straight pass-through: the request goes upstream as it
 arrived, pagination query and all, and the gateway's answer comes back byte for
 byte. The catalogue is therefore whatever your `UPSTREAM_API_KEY` can actually
-reach — the proxy keeps no list of its own, and `UPSTREAM_MODEL` appears in the
+reach. The proxy keeps no list of its own, and `UPSTREAM_MODEL` appears in the
 result only if the gateway lists it.
+
+`/v1/responses` is forwarded to upstream `/v1/responses`. The gateway must
+serve that path. The proxy does not rewrite it to Chat Completions and does
+not keep `previous_response_id` in memory.
 
 The public listener additionally requires an allowed `Host` header and rejects
 anything that looks like a browser; both are 403. See [Security](#security).
@@ -132,7 +137,6 @@ Do not quote them — Compose treats quotes in an env file as part of the value.
 | `UPSTREAM_TIMEOUT_MS` | Socket timeout per upstream request. Server timeout is this +30000. | `300000` (≥1) |
 | `RETRY_AFTER_SECONDS` | `Retry-After` on 429/5xx when upstream sends none. | `15` (≥1) |
 | `MAX_BODY_BYTES` | Largest accepted request body; bigger gets a 413. | `26214400` (≥1048576) |
-| `RESPONSES_STORE_MAX` | Conversation contexts kept in memory by the `/v1/responses` bridge. | `128` (≥1) |
 | `PROXY_LOG` | Request logging to stdout. | `true` / `false` |
 | `PROXY_LOG_VERBOSE` | Adds header and body dumps. Debugging only. | `false` |
 | `PROXY_LOG_BODY_LIMIT` | Characters logged before truncation. `0` truncates to nothing. | `800` (≥0) |
