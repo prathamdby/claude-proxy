@@ -102,11 +102,12 @@ function writeResponsesTextStream(res, text = "OK") {
   res.end('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","object":"response","status":"completed"}}\n\n');
 }
 
-function writeLingeringResponsesStream(res) {
+function writeLingeringResponsesStream(res, terminalType = "response.completed") {
   res.writeHead(200, { "content-type": "text/event-stream" });
   res.write('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_linger","object":"response","status":"in_progress"}}\n\n\n');
   res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"OK"}\n\n\n');
-  res.write('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_linger","object":"response","status":"completed"}}\n\n\n');
+  const status = terminalType === "response.completed" ? "completed" : terminalType === "response.incomplete" ? "incomplete" : "failed";
+  res.write(`event: ${terminalType}\ndata: ${JSON.stringify({ type: terminalType, response: { id: "resp_linger", object: "response", status } })}\n\n\n`);
 }
 
 const upstream = http.createServer((req, res) => {
@@ -171,9 +172,34 @@ const upstream = http.createServer((req, res) => {
 
     if (req.url.startsWith("/v1/responses")) {
       switch (payload.model) {
+        case "test-rate-responses":
+          res.writeHead(403, { "content-type": "application/json", "retry-after": "7" });
+          res.end(JSON.stringify({ error: { type: "gateway_error", message: "quota exceeded for this key" } }));
+          return;
+        case "test-permanent-responses":
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "model not found" } }));
+          return;
+        case "test-500-html-responses":
+          res.writeHead(500, { "content-type": "text/html" });
+          res.end("<html>gateway exploded</html>");
+          return;
+        case "test-empty-responses":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write('data: {"billing":{"request":{"success":true}},"object":"billing.summary"}\n\n');
+          res.end('event: ping\ndata: null\n\n');
+          return;
         case "test-lingering-responses":
           lingeringResponses.push(res);
           writeLingeringResponsesStream(res);
+          return;
+        case "test-lingering-incomplete":
+          lingeringResponses.push(res);
+          writeLingeringResponsesStream(res, "response.incomplete");
+          return;
+        case "test-lingering-failed":
+          lingeringResponses.push(res);
+          writeLingeringResponsesStream(res, "response.failed");
           return;
         case "test-response-tool":
           res.writeHead(200, { "content-type": "application/json" });
@@ -692,6 +718,96 @@ try {
   });
   assert.equal(webSearch.status, 200);
   assert.equal(captured.at(-1).payload.tools[0].type, "web_search");
+
+  const responsesNoAuth = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "glm-5.2", input: "x" })
+  });
+  assert.equal(responsesNoAuth.status, 401);
+  assert.equal(responsesNoAuth.headers.get("www-authenticate"), "Bearer");
+  const responsesNoAuthJson = await responsesNoAuth.json();
+  assert.equal(responsesNoAuthJson.error.type, "authentication_error");
+  assert.equal(responsesNoAuthJson.type, undefined);
+
+  const responsesByGet = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    headers: { authorization: `Bearer ${localKey}` }
+  });
+  assert.equal(responsesByGet.status, 404);
+  const responsesByGetJson = await responsesByGet.json();
+  assert.equal(responsesByGetJson.error.type, "not_found");
+  assert.equal(responsesByGetJson.type, undefined);
+
+  const responsesRate = await post("/v1/responses", { model: "test-rate-responses", input: "x" });
+  const responsesRateJson = await responsesRate.json();
+  assert.equal(responsesRate.status, 429);
+  assert.equal(responsesRate.headers.get("retry-after"), "7");
+  assert.equal(responsesRate.headers.get("x-proxy-original-status"), "403");
+  assert.equal(responsesRateJson.error.type, "rate_limit_error");
+  assert.equal(responsesRateJson.error.code, "rate_limit_exceeded");
+  assert.equal(responsesRateJson.type, undefined);
+
+  const responsesPermanent = await post("/v1/responses", { model: "test-permanent-responses", input: "x" });
+  assert.equal(responsesPermanent.status, 403);
+  assert.equal(responsesPermanent.headers.get("x-proxy-classification"), "permanent-pattern");
+  assert.equal((await responsesPermanent.json()).type, undefined);
+
+  const responsesHtml500 = await post("/v1/responses", { model: "test-500-html-responses", input: "x" });
+  const responsesHtml500Json = await responsesHtml500.json();
+  assert.equal(responsesHtml500.status, 500);
+  assert.equal(responsesHtml500.headers.get("retry-after"), "11");
+  assert.match(responsesHtml500.headers.get("content-type"), /application\/json/);
+  assert.equal(responsesHtml500Json.error.type, "api_error");
+  assert.equal(responsesHtml500Json.type, undefined);
+
+  const responsesEmpty = await post("/v1/responses", { model: "test-empty-responses", input: "x", stream: true });
+  const responsesEmptyJson = await responsesEmpty.json();
+  assert.equal(responsesEmpty.status, 503);
+  assert.equal(responsesEmpty.headers.get("retry-after"), "11");
+  assert.equal(responsesEmpty.headers.get("x-proxy-classification"), "empty-stream");
+  assert.equal(responsesEmptyJson.error.type, "api_error");
+  assert.equal(responsesEmptyJson.type, undefined);
+
+  for (const [model, terminal] of [
+    ["test-lingering-incomplete", "response.incomplete"],
+    ["test-lingering-failed", "response.failed"]
+  ]) {
+    const startedAt = Date.now();
+    const response = await post("/v1/responses", { model, input: "x", stream: true });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(text, new RegExp(terminal.replaceAll(".", "\\.")));
+    assert.ok(Date.now() - startedAt < 2000, `${terminal} stream should end on the terminal frame, took ${Date.now() - startedAt}ms`);
+    assert.doesNotMatch(text, /\n\n\n/);
+  }
+
+  const bogusIdBefore = captured.length;
+  const bogusPrevious = await post("/v1/responses", {
+    model: "glm-5.2",
+    previous_response_id: "resp_bogus_123",
+    input: "Again"
+  });
+  assert.equal(bogusPrevious.status, 200);
+  const bogusPreviousJson = await bogusPrevious.json();
+  assert.notEqual(bogusPrevious.status, 400);
+  assert.ok(!JSON.stringify(bogusPreviousJson).includes("Unknown or expired"));
+  assert.equal(captured[bogusIdBefore].payload.previous_response_id, "resp_bogus_123");
+  assert.match(captured[bogusIdBefore].url, /^\/v1\/responses/);
+
+  const responsesQueryBefore = captured.length;
+  const responsesWithQuery = await post("/v1/responses?foo=bar", {
+    model: "glm-5.2",
+    input: "x"
+  }, {
+    "Anthropic-Version": "2023-06-01",
+    "Anthropic-Beta": "should-not-be-forwarded"
+  });
+  assert.equal(responsesWithQuery.status, 200);
+  const responsesQueryWire = captured[responsesQueryBefore];
+  assert.match(responsesQueryWire.url, /^\/v1\/responses\?foo=bar$/);
+  assert.ok(!responsesQueryWire.url.includes("beta="));
+  assert.equal(responsesQueryWire.headers["anthropic-version"], undefined);
+  assert.equal(responsesQueryWire.headers["anthropic-beta"], undefined);
 
   // 403 quota/rate-limit -> 429, preserving upstream Retry-After.
   const rate = await post("/v1/messages", {
