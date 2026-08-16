@@ -74,7 +74,6 @@ services:
       UPSTREAM_TIMEOUT_MS: "${UPSTREAM_TIMEOUT_MS:?missing in .env - see .env.example}"
       RETRY_AFTER_SECONDS: "${RETRY_AFTER_SECONDS:?missing in .env - see .env.example}"
       MAX_BODY_BYTES: "${MAX_BODY_BYTES:?missing in .env - see .env.example}"
-      RESPONSES_STORE_MAX: "${RESPONSES_STORE_MAX:?missing in .env - see .env.example}"
       PROXY_LOG: "${PROXY_LOG:?missing in .env - see .env.example}"
       PROXY_LOG_VERBOSE: "${PROXY_LOG_VERBOSE:?missing in .env - see .env.example}"
       PROXY_LOG_BODY_LIMIT: "${PROXY_LOG_BODY_LIMIT:?missing in .env - see .env.example}"

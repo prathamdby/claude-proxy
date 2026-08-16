@@ -139,7 +139,6 @@ const config = (() => {
   readInteger("UPSTREAM_TIMEOUT_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });
   readInteger("RETRY_AFTER_SECONDS", "an integer of at least 1 (seconds)", { min: 1 });
   readInteger("MAX_BODY_BYTES", "an integer of at least 1048576 (1 MiB)", { min: 1024 * 1024 });
-  readInteger("RESPONSES_STORE_MAX", "an integer of at least 1", { min: 1 });
   readBoolean("PROXY_LOG", "console request logging");
   readBoolean("PROXY_LOG_VERBOSE", "header and body dumps in the console log");
   readInteger("PROXY_LOG_BODY_LIMIT", "an integer of at least 0 (characters; 0 truncates every logged body to nothing)", { min: 0 });
@@ -195,7 +194,6 @@ const defaultModel = config.UPSTREAM_MODEL;
 const upstreamTimeoutMs = config.UPSTREAM_TIMEOUT_MS;
 const retryAfterSeconds = config.RETRY_AFTER_SECONDS;
 const maxBodyBytes = config.MAX_BODY_BYTES;
-const responsesStoreMax = config.RESPONSES_STORE_MAX;
 
 // Betas the gateway is asked for on top of whatever the client sent. Claude Code
 // already sends most of these; context-1m-2025-08-07 and web-search-2025-03-05 are
@@ -300,13 +298,8 @@ const stats = {
   emptyStreamsRecovered: 0,
   streamsClosedOnTerminalFrame: 0,
   authRejected: 0,
-  hostRejected: 0,
-  responsesBridged: 0,
-  responsesStored: 0,
-  responsesStoreHits: 0,
-  responsesStoreMisses: 0
+  hostRejected: 0
 };
-const responseStore = new Map();
 
 const logEnabled = config.PROXY_LOG;
 const logVerbose = config.PROXY_LOG_VERBOSE;
@@ -485,11 +478,18 @@ const servedRoutes = new Map([
 ]);
 const servedRoutesMessage = `Supported endpoints: ${[...servedRoutes].map(([path, method]) => `${method} ${path}`).join(", ")}.`;
 
-// The two OpenAI-shaped routes; the Anthropic ones use their own error envelope.
-const openAiErrorPaths = new Set(["/v1/chat/completions", "/v1/responses"]);
+// Path picks the dialect. /v1/messages and everything under it speak Anthropic.
+// Every other served path speaks OpenAI, including /v1/responses as itself.
+function dialectFor(pathname) {
+  const anthropic = pathname === "/v1/messages" || String(pathname).startsWith("/v1/messages/");
+  return Object.freeze({
+    name: anthropic ? "anthropic" : "openai",
+    addBetaQuery: pathname === "/v1/messages"
+  });
+}
 
 function clientErrorShape(requestUrl, type, message, code = undefined) {
-  if (openAiErrorPaths.has(requestUrl?.pathname)) {
+  if (dialectFor(requestUrl?.pathname).name === "openai") {
     return { error: { message, type, ...(code ? { code } : {}) } };
   }
   return { type: "error", error: { type, message } };
@@ -525,13 +525,13 @@ function readBody(req) {
   });
 }
 
-function buildUpstreamPath(requestUrl, pathnameOverride = undefined) {
-  let pathname = pathnameOverride || requestUrl.pathname;
+function buildUpstreamPath(requestUrl) {
+  let pathname = requestUrl.pathname;
   if (upstreamBaseUrl.pathname !== "/") {
     pathname = `${upstreamBaseUrl.pathname.replace(/\/$/, "")}${pathname}`;
   }
   const target = new URL(`${pathname}${requestUrl.search}`, upstreamBaseUrl);
-  if (requestUrl.pathname === "/v1/messages" && !target.searchParams.has("beta")) {
+  if (dialectFor(requestUrl.pathname).addBetaQuery && !target.searchParams.has("beta")) {
     target.searchParams.set("beta", "true");
   }
   return `${target.pathname}${target.search}`;
@@ -567,20 +567,25 @@ const requestHeadersProxyOwns = new Set([
 
 // Filled in only when the caller omitted them. Claude Code always sends its own,
 // so in practice these serve exactly one caller: a bare `curl`, which needs the
-// content-type and anthropic-version before the gateway will answer at all.
+// content-type and, on Anthropic paths, anthropic-version before the gateway
+// will answer at all.
 const bareClientDefaults = {
   "user-agent": `claude-cli/${claudeCodeVersion} (external, sdk-cli)`,
-  "anthropic-version": "2023-06-01",
   "content-type": "application/json"
 };
 
-function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream) {
+function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
   const headers = {};
+  const omit = new Set(requestHeadersProxyOwns);
+  if (dialect.name === "openai") {
+    omit.add("anthropic-version");
+    omit.add("anthropic-beta");
+  }
 
   // Forward every client header except the ones the proxy has to control.
   for (const [name, value] of Object.entries(sourceHeaders)) {
     const key = name.toLowerCase();
-    if (requestHeadersProxyOwns.has(key) || value === undefined) continue;
+    if (omit.has(key) || value === undefined) continue;
     headers[key] = value;
   }
 
@@ -590,18 +595,21 @@ function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream) {
 
   headers["x-claude-code-session-id"] = sessionId(sourceHeaders);
   headers.authorization = `Bearer ${apiKey}`;
-  headers["anthropic-beta"] = mergeBetaHeader(sourceHeaders["anthropic-beta"]);
+  if (dialect.name === "anthropic") {
+    if (headers["anthropic-version"] === undefined) headers["anthropic-version"] = "2023-06-01";
+    headers["anthropic-beta"] = mergeBetaHeader(sourceHeaders["anthropic-beta"]);
+  }
   headers.accept = wantsStream ? "text/event-stream" : sourceHeaders.accept || "application/json";
   headers["accept-encoding"] = "identity";
   headers["content-length"] = bodyLength;
   return headers;
 }
 
-function requestUpstream(req, requestUrl, body, wantsStream, onResponse, pathnameOverride = undefined) {
+function requestUpstream(req, requestUrl, body, wantsStream, onResponse) {
   const transport = upstreamBaseUrl.protocol === "http:" ? http : https;
   const requestId = req._proxyRequestId || "--------";
-  const upstreamPath = buildUpstreamPath(requestUrl, pathnameOverride);
-  const upstreamHeaders = safeUpstreamHeaders(req.headers, body.length, wantsStream);
+  const upstreamPath = buildUpstreamPath(requestUrl);
+  const upstreamHeaders = safeUpstreamHeaders(req.headers, body.length, wantsStream, dialectFor(requestUrl.pathname));
   const startedRequestAt = Date.now();
 
   log(requestId, "->UP", `${req.method} ${upstreamBaseUrl.origin}${upstreamPath} (${body.length} bytes, stream=${wantsStream})`);
@@ -987,7 +995,10 @@ function isTerminalSseFrame(frame) {
   if (!data) return false;
   try {
     const payload = JSON.parse(data);
-    return payload?.type === "message_stop";
+    return payload?.type === "message_stop"
+      || payload?.type === "response.completed"
+      || payload?.type === "response.incomplete"
+      || payload?.type === "response.failed";
   } catch {
     return false;
   }
@@ -1144,579 +1155,6 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
   });
 }
 
-function responseContentToChat(content, role) {
-  if (typeof content === "string" || content === null || content === undefined) {
-    return content ?? "";
-  }
-  if (!Array.isArray(content)) return String(content);
-  const chatParts = [];
-  for (const part of content) {
-    if (typeof part === "string") {
-      chatParts.push({ type: "text", text: part });
-      continue;
-    }
-    if (!part || typeof part !== "object") continue;
-    if (["input_text", "output_text", "text"].includes(part.type) && typeof part.text === "string") {
-      chatParts.push({ type: "text", text: part.text });
-      continue;
-    }
-    if (role === "user" && part.type === "input_image") {
-      const url = part.image_url || part.url;
-      if (typeof url === "string" && url) {
-        chatParts.push({ type: "image_url", image_url: { url, ...(part.detail ? { detail: part.detail } : {}) } });
-        continue;
-      }
-    }
-    if (part.type === "refusal" && typeof part.refusal === "string") {
-      chatParts.push({ type: "text", text: part.refusal });
-      continue;
-    }
-    throw new HttpError(400, "invalid_request_error", `Unsupported Responses content part type: ${String(part.type || "unknown")}.`);
-  }
-  if (!chatParts.length) return "";
-  if (chatParts.every((part) => part.type === "text")) return chatParts.map((part) => part.text).join("");
-  return chatParts;
-}
-
-function responseFunctionToolToChat(tool) {
-  if (!tool || tool.type !== "function") {
-    throw new HttpError(400, "invalid_request_error", `Responses tool type ${String(tool?.type || "unknown")} cannot be represented by Chat Completions.`);
-  }
-  return {
-    type: "function",
-    function: {
-      name: tool.name,
-      ...(tool.description !== undefined ? { description: tool.description } : {}),
-      ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {}),
-      ...(tool.strict !== undefined ? { strict: tool.strict } : {})
-    }
-  };
-}
-
-function responseToolChoiceToChat(choice) {
-  if (choice === undefined) return undefined;
-  if (typeof choice === "string") return choice;
-  if (!choice || typeof choice !== "object") return choice;
-  if (choice.type === "function" && choice.name) {
-    return { type: "function", function: { name: choice.name } };
-  }
-  throw new HttpError(400, "invalid_request_error", `Responses tool_choice type ${String(choice.type || "unknown")} cannot be represented by Chat Completions.`);
-}
-
-function responseTextFormatToChat(textConfig) {
-  const format = textConfig?.format;
-  if (!format) return undefined;
-  if (format.type === "text") return { type: "text" };
-  if (format.type === "json_object") return { type: "json_object" };
-  if (format.type === "json_schema") {
-    return {
-      type: "json_schema",
-      json_schema: {
-        name: format.name,
-        ...(format.description !== undefined ? { description: format.description } : {}),
-        schema: format.schema,
-        ...(format.strict !== undefined ? { strict: format.strict } : {})
-      }
-    };
-  }
-  throw new HttpError(400, "invalid_request_error", `Responses text.format type ${String(format.type || "unknown")} cannot be represented by Chat Completions.`);
-}
-
-function responseItemToChatMessages(item) {
-  if (!item || typeof item !== "object") {
-    throw new HttpError(400, "invalid_request_error", "Responses input items must be objects.");
-  }
-  if (item.type === "function_call") {
-    const callId = item.call_id || item.id || `call_${crypto.randomUUID().replaceAll("-", "")}`;
-    return [{
-      role: "assistant",
-      content: null,
-      tool_calls: [{
-        id: callId,
-        type: "function",
-        function: {
-          name: item.name,
-          arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {})
-        }
-      }]
-    }];
-  }
-  if (item.type === "function_call_output") {
-    if (!item.call_id) throw new HttpError(400, "invalid_request_error", "function_call_output requires call_id.");
-    return [{
-      role: "tool",
-      tool_call_id: item.call_id,
-      content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "")
-    }];
-  }
-  if (item.type && item.type !== "message") {
-    if (item.type === "reasoning") return [];
-    throw new HttpError(400, "invalid_request_error", `Responses input item type ${String(item.type)} cannot be represented by Chat Completions.`);
-  }
-  const role = item.role || "user";
-  if (!["system", "developer", "user", "assistant"].includes(role)) {
-    throw new HttpError(400, "invalid_request_error", `Unsupported Responses message role: ${String(role)}.`);
-  }
-  return [{ role, content: responseContentToChat(item.content, role) }];
-}
-
-function responseInputToChatMessages(input) {
-  if (typeof input === "string") return [{ role: "user", content: input }];
-  if (input === undefined || input === null) return [];
-  if (!Array.isArray(input)) {
-    throw new HttpError(400, "invalid_request_error", "Responses input must be a string or an array of Items.");
-  }
-  const messages = [];
-  for (const item of input) messages.push(...responseItemToChatMessages(item));
-  return messages;
-}
-
-function getStoredResponseContext(responseId) {
-  const entry = responseStore.get(responseId);
-  if (!entry) {
-    stats.responsesStoreMisses += 1;
-    throw new HttpError(400, "invalid_request_error", `Unknown or expired previous_response_id: ${responseId}.`);
-  }
-  stats.responsesStoreHits += 1;
-  responseStore.delete(responseId);
-  responseStore.set(responseId, entry);
-  return structuredClone(entry.messages);
-}
-
-function storeResponseContext(responseId, messages) {
-  responseStore.set(responseId, { messages: structuredClone(messages), storedAt: Date.now() });
-  while (responseStore.size > responsesStoreMax) {
-    responseStore.delete(responseStore.keys().next().value);
-  }
-  stats.responsesStored += 1;
-}
-
-function responsesRequestToChat(payload) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new HttpError(400, "invalid_request_error", "Responses request body must be a JSON object.");
-  }
-  if (payload.background === true) {
-    throw new HttpError(400, "invalid_request_error", "background mode cannot be represented by Chat Completions.");
-  }
-  if (payload.conversation !== undefined && payload.conversation !== null) {
-    throw new HttpError(400, "invalid_request_error", "Responses conversation objects cannot be represented by Chat Completions.");
-  }
-
-  const priorMessages = payload.previous_response_id ? getStoredResponseContext(payload.previous_response_id) : [];
-  const currentInputMessages = responseInputToChatMessages(payload.input);
-  const contextMessages = [...priorMessages, ...currentInputMessages];
-  if (!contextMessages.length) throw new HttpError(400, "invalid_request_error", "Responses request requires input or previous_response_id.");
-
-  const messages = [];
-  if (typeof payload.instructions === "string" && payload.instructions) {
-    messages.push({ role: "system", content: payload.instructions });
-  }
-  messages.push(...contextMessages);
-
-  const chat = {
-    model: payload.model || defaultModel,
-    messages,
-    stream: true,
-    stream_options: { include_usage: true }
-  };
-  if (payload.max_output_tokens !== undefined) chat.max_tokens = payload.max_output_tokens;
-  if (payload.temperature !== undefined) chat.temperature = payload.temperature;
-  if (payload.top_p !== undefined) chat.top_p = payload.top_p;
-  if (payload.parallel_tool_calls !== undefined) chat.parallel_tool_calls = payload.parallel_tool_calls;
-  if (payload.reasoning?.effort !== undefined) chat.reasoning_effort = payload.reasoning.effort;
-  if (payload.seed !== undefined) chat.seed = payload.seed;
-  if (payload.user !== undefined) chat.user = payload.user;
-  if (payload.stop !== undefined) chat.stop = payload.stop;
-  if (payload.tools !== undefined) chat.tools = payload.tools.map(responseFunctionToolToChat);
-  const toolChoice = responseToolChoiceToChat(payload.tool_choice);
-  if (toolChoice !== undefined) chat.tool_choice = toolChoice;
-  const responseFormat = responseTextFormatToChat(payload.text);
-  if (responseFormat !== undefined) chat.response_format = responseFormat;
-  return { chat, contextMessages };
-}
-
-function newResponsesState(payload) {
-  return {
-    responseId: `resp_${crypto.randomUUID().replaceAll("-", "")}`,
-    createdAt: Math.floor(Date.now() / 1000),
-    completedAt: null,
-    model: payload.model || defaultModel,
-    payload,
-    text: "",
-    textItemId: `msg_${crypto.randomUUID().replaceAll("-", "")}`,
-    textOutputIndex: null,
-    textStarted: false,
-    toolCalls: new Map(),
-    outputOrder: [],
-    nextOutputIndex: 0,
-    finishReason: null,
-    usage: null,
-    sequence: 0
-  };
-}
-
-function responsesUsage(chatUsage) {
-  if (!chatUsage) return null;
-  const input = Number(chatUsage.prompt_tokens ?? chatUsage.input_tokens ?? 0);
-  const output = Number(chatUsage.completion_tokens ?? chatUsage.output_tokens ?? 0);
-  const reasoning = Number(chatUsage.completion_tokens_details?.reasoning_tokens ?? chatUsage.output_tokens_details?.reasoning_tokens ?? 0);
-  const cached = Number(chatUsage.prompt_tokens_details?.cached_tokens ?? chatUsage.input_tokens_details?.cached_tokens ?? 0);
-  return {
-    input_tokens: input,
-    input_tokens_details: { cached_tokens: cached },
-    output_tokens: output,
-    output_tokens_details: { reasoning_tokens: reasoning },
-    total_tokens: Number(chatUsage.total_tokens ?? input + output)
-  };
-}
-
-function responsesOutputItems(state, status = "completed") {
-  const items = [];
-  for (const entry of [...state.outputOrder].sort((a, b) => a.outputIndex - b.outputIndex)) {
-    if (entry.kind === "text") {
-      items.push({
-        id: state.textItemId,
-        type: "message",
-        status,
-        role: "assistant",
-        content: [{ type: "output_text", text: state.text, annotations: [], logprobs: [] }]
-      });
-    } else {
-      const call = state.toolCalls.get(entry.chatIndex);
-      if (!call) continue;
-      items.push({
-        id: call.itemId,
-        type: "function_call",
-        status,
-        arguments: call.arguments,
-        call_id: call.callId,
-        name: call.name
-      });
-    }
-  }
-  return items;
-}
-
-function responseObject(state, status = "completed") {
-  const payload = state.payload;
-  const incomplete = state.finishReason === "length" || status === "incomplete";
-  const effectiveStatus = incomplete ? "incomplete" : status;
-  return {
-    id: state.responseId,
-    object: "response",
-    created_at: state.createdAt,
-    completed_at: effectiveStatus === "completed" ? (state.completedAt || Math.floor(Date.now() / 1000)) : null,
-    status: effectiveStatus,
-    error: null,
-    incomplete_details: incomplete ? { reason: "max_output_tokens" } : null,
-    instructions: payload.instructions ?? null,
-    max_output_tokens: payload.max_output_tokens ?? null,
-    model: state.model,
-    output: effectiveStatus === "in_progress" ? [] : responsesOutputItems(state, "completed"),
-    parallel_tool_calls: payload.parallel_tool_calls ?? true,
-    previous_response_id: payload.previous_response_id ?? null,
-    reasoning: {
-      effort: payload.reasoning?.effort ?? null,
-      summary: payload.reasoning?.summary ?? null
-    },
-    store: payload.store !== false,
-    temperature: payload.temperature ?? 1,
-    text: payload.text ?? { format: { type: "text" } },
-    tool_choice: payload.tool_choice ?? "auto",
-    tools: payload.tools ?? [],
-    top_p: payload.top_p ?? 1,
-    truncation: payload.truncation ?? "disabled",
-    usage: effectiveStatus === "in_progress" ? null : responsesUsage(state.usage),
-    user: payload.user ?? null,
-    metadata: payload.metadata ?? {}
-  };
-}
-
-function assistantChatMessageFromState(state) {
-  const toolCalls = [...state.toolCalls.entries()]
-    .sort(([a], [b]) => a - b)
-    .map(([, call]) => ({
-      id: call.callId,
-      type: "function",
-      function: { name: call.name, arguments: call.arguments }
-    }));
-  return {
-    role: "assistant",
-    content: state.text || (toolCalls.length ? null : ""),
-    ...(toolCalls.length ? { tool_calls: toolCalls } : {})
-  };
-}
-
-function applyChatChunkToResponsesState(state, chunk, callbacks = {}) {
-  if (chunk.model) state.model = chunk.model;
-  if (chunk.usage) state.usage = chunk.usage;
-  const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : null;
-  if (!choice) return;
-  if (choice.finish_reason) state.finishReason = choice.finish_reason;
-  const delta = choice.delta || {};
-  if (typeof delta.content === "string" && delta.content) {
-    if (!state.textStarted) {
-      state.textStarted = true;
-      state.textOutputIndex = state.nextOutputIndex++;
-      state.outputOrder.push({ kind: "text", outputIndex: state.textOutputIndex });
-      callbacks.onTextStart?.();
-    }
-    state.text += delta.content;
-    callbacks.onTextDelta?.(delta.content);
-  }
-  for (const toolDelta of delta.tool_calls || []) {
-    const chatIndex = Number(toolDelta.index ?? 0);
-    let call = state.toolCalls.get(chatIndex);
-    let isNew = false;
-    if (!call) {
-      isNew = true;
-      call = {
-        chatIndex,
-        outputIndex: state.nextOutputIndex++,
-        itemId: `fc_${crypto.randomUUID().replaceAll("-", "")}`,
-        callId: toolDelta.id || `call_${crypto.randomUUID().replaceAll("-", "")}`,
-        name: toolDelta.function?.name || "",
-        arguments: ""
-      };
-      state.toolCalls.set(chatIndex, call);
-      state.outputOrder.push({ kind: "tool", chatIndex, outputIndex: call.outputIndex });
-      callbacks.onToolStart?.(call);
-    }
-    if (toolDelta.id) call.callId = toolDelta.id;
-    if (!isNew && toolDelta.function?.name) call.name = `${call.name || ""}${toolDelta.function.name}`;
-    const argsDelta = toolDelta.function?.arguments;
-    if (typeof argsDelta === "string" && argsDelta) {
-      call.arguments += argsDelta;
-      callbacks.onToolDelta?.(call, argsDelta);
-    }
-  }
-}
-
-// A gateway that ignores `stream: true` answers with one whole Chat Completions
-// object instead. Replay it through the same delta path so both wire shapes end
-// up in an identical Responses state.
-function applyChatCompletionToResponsesState(state, completion, callbacks) {
-  state.model = completion.model || state.model;
-  state.usage = completion.usage || null;
-  const choice = completion.choices?.[0] || {};
-  state.finishReason = choice.finish_reason || "stop";
-  const message = choice.message || {};
-  if (typeof message.content === "string" && message.content) {
-    applyChatChunkToResponsesState(state, { choices: [{ delta: { content: message.content } }] }, callbacks);
-  }
-  if (Array.isArray(message.tool_calls)) {
-    const toolCalls = message.tool_calls.map((call, index) => ({ ...call, index }));
-    applyChatChunkToResponsesState(state, { choices: [{ delta: { tool_calls: toolCalls } }] }, callbacks);
-  }
-}
-
-function writeResponsesEvent(res, state, type, fields = {}) {
-  const event = { type, ...fields, sequence_number: ++state.sequence };
-  res.write(`event: ${type}\ndata: ${JSON.stringify(event)}\n\n`);
-}
-
-function finishResponsesState(state, baseMessages) {
-  state.completedAt = Math.floor(Date.now() / 1000);
-  if (state.payload.store !== false) {
-    storeResponseContext(state.responseId, [...baseMessages, assistantChatMessageFromState(state)]);
-  }
-}
-
-function collectResponsesFromChat(req, res, requestUrl, payload, chatPayload, baseMessages) {
-  const state = newResponsesState(payload);
-  const body = Buffer.from(JSON.stringify(chatPayload));
-  let buffer = "";
-  const upstream = requestUpstream(req, requestUrl, body, true, (upstreamRes) => {
-    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
-    const contentType = String(upstreamRes.headers["content-type"] || "");
-    if (!contentType.includes("text/event-stream")) {
-      collectResponseBody(upstreamRes).then((text) => {
-        try {
-          applyChatCompletionToResponsesState(state, JSON.parse(text));
-          finishResponsesState(state, baseMessages);
-          sendJson(res, 200, responseObject(state));
-        } catch (error) {
-          sendNetworkError(res, requestUrl, new Error(`Invalid Chat Completions JSON from upstream: ${error.message}`));
-        }
-      }).catch((error) => sendNetworkError(res, requestUrl, error));
-      return;
-    }
-    upstreamRes.setEncoding("utf8");
-    upstreamRes.on("data", (chunk) => {
-      buffer = parseSseEvents(buffer + chunk, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk));
-    });
-    upstreamRes.on("end", () => {
-      if (buffer.trim()) parseSseEvents(`${buffer}\n\n`, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk));
-      if (!state.textStarted && !state.toolCalls.size) {
-        stats.emptyStreamsRecovered += 1;
-        sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty Chat Completions stream while bridging Responses.");
-        return;
-      }
-      finishResponsesState(state, baseMessages);
-      sendJson(res, 200, responseObject(state));
-    });
-    upstreamRes.on("error", (error) => sendNetworkError(res, requestUrl, error));
-  }, "/v1/chat/completions");
-  upstream.on("error", (error) => sendNetworkError(res, requestUrl, error));
-}
-
-function streamResponsesFromChat(req, res, requestUrl, payload, chatPayload, baseMessages) {
-  const state = newResponsesState(payload);
-  const body = Buffer.from(JSON.stringify(chatPayload));
-  let buffer = "";
-  let started = false;
-  let finished = false;
-
-  function start() {
-    if (started) return;
-    started = true;
-    res.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-store",
-      connection: "keep-alive"
-    });
-    writeResponsesEvent(res, state, "response.created", { response: responseObject(state, "in_progress") });
-    writeResponsesEvent(res, state, "response.in_progress", { response: responseObject(state, "in_progress") });
-  }
-
-  function onTextStart() {
-    start();
-    writeResponsesEvent(res, state, "response.output_item.added", {
-      output_index: state.textOutputIndex,
-      item: { id: state.textItemId, type: "message", status: "in_progress", role: "assistant", content: [] }
-    });
-    writeResponsesEvent(res, state, "response.content_part.added", {
-      item_id: state.textItemId,
-      output_index: state.textOutputIndex,
-      content_index: 0,
-      part: { type: "output_text", text: "", annotations: [], logprobs: [] }
-    });
-  }
-
-  function onTextDelta(delta) {
-    start();
-    writeResponsesEvent(res, state, "response.output_text.delta", {
-      item_id: state.textItemId,
-      output_index: state.textOutputIndex,
-      content_index: 0,
-      delta,
-      logprobs: []
-    });
-  }
-
-  function onToolStart(call) {
-    start();
-    writeResponsesEvent(res, state, "response.output_item.added", {
-      output_index: call.outputIndex,
-      item: { id: call.itemId, type: "function_call", status: "in_progress", arguments: "", call_id: call.callId, name: call.name }
-    });
-  }
-
-  function onToolDelta(call, delta) {
-    start();
-    writeResponsesEvent(res, state, "response.function_call_arguments.delta", {
-      item_id: call.itemId,
-      output_index: call.outputIndex,
-      delta
-    });
-  }
-
-  function complete() {
-    if (finished) return;
-    finished = true;
-    if (!state.textStarted && !state.toolCalls.size) {
-      if (!started) {
-        stats.emptyStreamsRecovered += 1;
-        sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty Chat Completions stream while bridging Responses.");
-      } else {
-        res.end();
-      }
-      return;
-    }
-    start();
-    if (state.textStarted) {
-      writeResponsesEvent(res, state, "response.output_text.done", {
-        item_id: state.textItemId,
-        output_index: state.textOutputIndex,
-        content_index: 0,
-        text: state.text,
-        logprobs: []
-      });
-      writeResponsesEvent(res, state, "response.content_part.done", {
-        item_id: state.textItemId,
-        output_index: state.textOutputIndex,
-        content_index: 0,
-        part: { type: "output_text", text: state.text, annotations: [], logprobs: [] }
-      });
-      writeResponsesEvent(res, state, "response.output_item.done", {
-        output_index: state.textOutputIndex,
-        item: responsesOutputItems(state).find((item) => item.id === state.textItemId)
-      });
-    }
-    for (const [, call] of [...state.toolCalls.entries()].sort(([a], [b]) => a - b)) {
-      writeResponsesEvent(res, state, "response.function_call_arguments.done", {
-        item_id: call.itemId,
-        output_index: call.outputIndex,
-        name: call.name,
-        arguments: call.arguments
-      });
-      writeResponsesEvent(res, state, "response.output_item.done", {
-        output_index: call.outputIndex,
-        item: responsesOutputItems(state).find((item) => item.id === call.itemId)
-      });
-    }
-    finishResponsesState(state, baseMessages);
-    const object = responseObject(state);
-    writeResponsesEvent(res, state, object.status === "incomplete" ? "response.incomplete" : "response.completed", { response: object });
-    res.end();
-  }
-
-  const streamCallbacks = { onTextStart, onTextDelta, onToolStart, onToolDelta };
-
-  const upstream = requestUpstream(req, requestUrl, body, true, (upstreamRes) => {
-    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
-    const contentType = String(upstreamRes.headers["content-type"] || "");
-    if (!contentType.includes("text/event-stream")) {
-      collectResponseBody(upstreamRes).then((text) => {
-        try {
-          applyChatCompletionToResponsesState(state, JSON.parse(text), streamCallbacks);
-          complete();
-        } catch (error) {
-          if (!started) sendNetworkError(res, requestUrl, new Error(`Invalid Chat Completions JSON from upstream: ${error.message}`));
-          else res.destroy(error);
-        }
-      }).catch((error) => started ? res.destroy(error) : sendNetworkError(res, requestUrl, error));
-      return;
-    }
-    upstreamRes.setEncoding("utf8");
-    upstreamRes.on("data", (chunk) => {
-      buffer = parseSseEvents(buffer + chunk, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk, streamCallbacks));
-    });
-    upstreamRes.on("end", () => {
-      if (buffer.trim()) parseSseEvents(`${buffer}\n\n`, (payloadChunk) => applyChatChunkToResponsesState(state, payloadChunk, streamCallbacks));
-      complete();
-    });
-    upstreamRes.on("error", (error) => {
-      if (!started) sendNetworkError(res, requestUrl, error);
-      else res.destroy(error);
-    });
-  }, "/v1/chat/completions");
-  upstream.on("error", (error) => {
-    if (!started) sendNetworkError(res, requestUrl, error);
-    else res.destroy(error);
-  });
-}
-
-function handleResponsesRequest(req, res, requestUrl, payload) {
-  const { chat, contextMessages } = responsesRequestToChat(payload);
-  stats.responsesBridged += 1;
-  if (payload.stream === true) {
-    streamResponsesFromChat(req, res, requestUrl, payload, chat, contextMessages);
-  } else {
-    collectResponsesFromChat(req, res, requestUrl, payload, chat, contextMessages);
-  }
-}
-
 function pipeRequest(req, res, requestUrl, body, wantsStream, transparent = false) {
   const upstream = requestUpstream(req, requestUrl, body, wantsStream, (upstreamRes) => {
     // A transparent route forwards whatever the gateway answered, errors
@@ -1828,9 +1266,7 @@ const server = http.createServer(async (req, res) => {
     const wantsStream = payload.stream === true;
     trace(requestId, "ROUTE", `${requestUrl.pathname} model=${payload.model || "?"} stream=${wantsStream}`);
 
-    if (requestUrl.pathname === "/v1/responses") {
-      handleResponsesRequest(req, res, requestUrl, payload);
-    } else if (requestUrl.pathname === "/v1/messages" && !wantsStream) {
+    if (requestUrl.pathname === "/v1/messages" && !wantsStream) {
       collectAnthropicStreamingResponse(req, res, requestUrl, payload);
     } else {
       pipeRequest(req, res, requestUrl, body, wantsStream);

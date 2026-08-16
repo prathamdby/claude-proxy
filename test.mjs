@@ -81,25 +81,33 @@ function writeOpenAiStream(res) {  res.writeHead(200, { "content-type": "text/ev
   res.end('data: [DONE]\n\n');
 }
 
-function writeOpenAiToolStream(res) {
+function writeResponsesJson(res, payload) {
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({
+    id: "resp_upstream",
+    object: "response",
+    status: "completed",
+    previous_response_id: payload.previous_response_id ?? null,
+    output: [{ type: "message", content: [{ type: "output_text", text: "OK" }] }],
+    usage: { input_tokens: 3, output_tokens: 1 }
+  }));
+}
+
+function writeResponsesTextStream(res, text = "OK") {
   res.writeHead(200, { "content-type": "text/event-stream" });
-  const chunks = [
-    {
-      id: "chat_tool", object: "chat.completion.chunk", model: "glm-5.2",
-      choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_weather", type: "function", function: { name: "get_weather", arguments: '{"city":' } }] }, finish_reason: null }]
-    },
-    {
-      id: "chat_tool", object: "chat.completion.chunk", model: "glm-5.2",
-      choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"Lahore"}' } }] }, finish_reason: null }]
-    },
-    {
-      id: "chat_tool", object: "chat.completion.chunk", model: "glm-5.2",
-      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-      usage: { prompt_tokens: 8, completion_tokens: 5, total_tokens: 13 }
-    }
-  ];
-  for (const chunk of chunks) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-  res.end('data: [DONE]\n\n');
+  res.write('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_test","object":"response","status":"in_progress"}}\n\n');
+  res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n`);
+  res.write('data: {"billing":{"request":{"success":true}},"object":"billing.summary"}\n\n');
+  res.write('data: null\n\n');
+  res.end('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","object":"response","status":"completed"}}\n\n');
+}
+
+function writeLingeringResponsesStream(res, terminalType = "response.completed") {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.write('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_linger","object":"response","status":"in_progress"}}\n\n\n');
+  res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"OK"}\n\n\n');
+  const status = terminalType === "response.completed" ? "completed" : terminalType === "response.incomplete" ? "incomplete" : "failed";
+  res.write(`event: ${terminalType}\ndata: ${JSON.stringify({ type: terminalType, response: { id: "resp_linger", object: "response", status } })}\n\n\n`);
 }
 
 const upstream = http.createServer((req, res) => {
@@ -162,14 +170,65 @@ const upstream = http.createServer((req, res) => {
       }
     }
 
+    if (req.url.startsWith("/v1/responses")) {
+      switch (payload.model) {
+        case "test-rate-responses":
+          res.writeHead(403, { "content-type": "application/json", "retry-after": "7" });
+          res.end(JSON.stringify({ error: { type: "gateway_error", message: "quota exceeded for this key" } }));
+          return;
+        case "test-permanent-responses":
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "model not found" } }));
+          return;
+        case "test-500-html-responses":
+          res.writeHead(500, { "content-type": "text/html" });
+          res.end("<html>gateway exploded</html>");
+          return;
+        case "test-empty-responses":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write('data: {"billing":{"request":{"success":true}},"object":"billing.summary"}\n\n');
+          res.end('event: ping\ndata: null\n\n');
+          return;
+        case "test-lingering-responses":
+          lingeringResponses.push(res);
+          writeLingeringResponsesStream(res);
+          return;
+        case "test-lingering-incomplete":
+          lingeringResponses.push(res);
+          writeLingeringResponsesStream(res, "response.incomplete");
+          return;
+        case "test-lingering-failed":
+          lingeringResponses.push(res);
+          writeLingeringResponsesStream(res, "response.failed");
+          return;
+        case "test-response-tool":
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            id: "resp_tool",
+            object: "response",
+            status: "completed",
+            output: [{
+              type: "function_call",
+              call_id: "call_weather",
+              name: "get_weather",
+              arguments: '{"city":"Lahore"}'
+            }]
+          }));
+          return;
+        default:
+          if (payload.stream === true) {
+            writeResponsesTextStream(res);
+            return;
+          }
+          writeResponsesJson(res, payload);
+          return;
+      }
+    }
+
     if (req.url.startsWith("/v1/chat/completions")) {
       if (payload.model === "test-rate-openai") {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "用户额度不足", type: "gateway_error" } }));
-        return;
-      }
-      if (payload.model === "test-response-tool") {
-        writeOpenAiToolStream(res);
         return;
       }
       writeOpenAiStream(res);
@@ -238,7 +297,6 @@ const proxyEnv = {
   UPSTREAM_TIMEOUT_MS: "300000",
   RETRY_AFTER_SECONDS: "11",
   MAX_BODY_BYTES: "26214400",
-  RESPONSES_STORE_MAX: "128",
   PROXY_LOG: "true",
   PROXY_LOG_VERBOSE: "false",
   PROXY_LOG_BODY_LIMIT: "800",
@@ -375,7 +433,7 @@ try {
   const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/unserved`);
   assert.equal(rejected.status, 401);
   const rejectedBody = await rejected.json();
-  assert.equal(rejectedBody.type, "error");
+  assert.equal(rejectedBody.error.type, "authentication_error");
 
   // The same ordering holds on the new GET route: an unauthenticated
   // /v1/models is 401, and nothing may leave for the gateway. A 404 here
@@ -415,6 +473,8 @@ try {
   assert.equal(modelsRequest.headers.authorization, `Bearer ${testApiKey}`);
   assert.notEqual(modelsRequest.headers.authorization, `Bearer ${localKey}`);
   assert.equal(modelsRequest.headers["x-api-key"], undefined);
+  assert.equal(modelsRequest.headers["anthropic-version"], undefined);
+  assert.equal(modelsRequest.headers["anthropic-beta"], undefined);
 
   // Even a GET that arrives carrying a body is forwarded without one: the
   // proxy sends Buffer.alloc(0) regardless, and an encoded query crosses
@@ -464,17 +524,19 @@ try {
   // nothing that tells a prober which half of the pair they guessed right.
   const modelsByPost = await post("/v1/models", {});
   assert.equal(modelsByPost.status, 404);
-  const notFoundText = await modelsByPost.text();
   const messagesByGet = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
     headers: { authorization: `Bearer ${localKey}` }
   });
   assert.equal(messagesByGet.status, 404);
-  assert.equal(await messagesByGet.text(), notFoundText);
+  const modelsNotFound = await modelsByPost.json();
+  const messagesNotFound = await messagesByGet.json();
+  assert.equal(modelsNotFound.error.type, "not_found");
+  assert.equal(messagesNotFound.error.type, "not_found");
+  assert.equal(modelsNotFound.type, undefined);
+  assert.equal(messagesNotFound.type, "error");
 
   // The 404 text is generated from the route table, so it can only ever name
   // routes that are really served -- method included.
-  const notFoundBody = JSON.parse(notFoundText);
-  assert.equal(notFoundBody.error.type, "not_found");
   for (const route of [
     "POST /v1/messages",
     "POST /v1/messages/count_tokens",
@@ -482,7 +544,8 @@ try {
     "POST /v1/responses",
     "GET /v1/models"
   ]) {
-    assert.ok(notFoundBody.error.message.includes(route), `404 text must name ${route}`);
+    assert.ok(modelsNotFound.error.message.includes(route), `OpenAI 404 text must name ${route}`);
+    assert.ok(messagesNotFound.error.message.includes(route), `Anthropic 404 text must name ${route}`);
   }
 
   // Streaming + SSE sanitation + beta merge + session preservation.
@@ -541,10 +604,14 @@ try {
   assert.equal(toolJson.content[0].partial_json, undefined);
 
   // OpenAI-compatible streaming remains supported and sanitized.
+  const openAiIndex = captured.length;
   const streamedOpenAi = await post("/v1/chat/completions", {
     model: "glm-5.2",
     stream: true,
     messages: [{ role: "user", content: "Reply OK" }]
+  }, {
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "should-not-be-forwarded"
   });
   const openAiSse = await streamedOpenAi.text();
   assert.equal(streamedOpenAi.status, 200);
@@ -552,8 +619,10 @@ try {
   assert.match(openAiSse, /\[DONE\]/);
   assert.doesNotMatch(openAiSse, /billing[._]summary/);
   assert.doesNotMatch(openAiSse, /data:\s*null/);
+  assert.equal(captured[openAiIndex].headers["anthropic-version"], undefined);
+  assert.equal(captured[openAiIndex].headers["anthropic-beta"], undefined);
 
-  // Responses API is bridged through upstream Chat Completions (non-streaming).
+  // Responses is forwarded to upstream /v1/responses, not rewritten to Chat Completions.
   const responsesBefore = captured.length;
   const responseApi = await post("/v1/responses", {
     model: "glm-5.2",
@@ -566,35 +635,31 @@ try {
   assert.equal(responseApi.status, 200);
   assert.equal(responseApiJson.object, "response");
   assert.equal(responseApiJson.status, "completed");
-  assert.equal(responseApiJson.output[0].type, "message");
+  assert.equal(responseApiJson.id, "resp_upstream");
   assert.equal(responseApiJson.output[0].content[0].text, "OK");
-  assert.equal(responseApiJson.usage.input_tokens, 3);
-  assert.equal(responseApiJson.usage.output_tokens, 1);
-  const bridgedRequest = captured[responsesBefore];
-  assert.match(bridgedRequest.url, /^\/v1\/chat\/completions/);
-  assert.equal(bridgedRequest.payload.stream, true);
-  assert.equal(bridgedRequest.payload.max_tokens, 32);
-  assert.deepEqual(bridgedRequest.payload.messages.slice(-2), [
-    { role: "system", content: "Be concise." },
-    { role: "user", content: "Reply OK" }
-  ]);
+  const responsesWire = captured[responsesBefore];
+  assert.match(responsesWire.url, /^\/v1\/responses/);
+  assert.equal(responsesWire.payload.input, "Reply OK");
+  assert.equal(responsesWire.payload.messages, undefined);
+  assert.equal(responsesWire.headers["anthropic-version"], undefined);
+  assert.equal(responsesWire.headers["anthropic-beta"], undefined);
 
-  // previous_response_id replays stored Chat Completions context.
+  // previous_response_id is forwarded as sent. The gateway owns the chain.
   const previousResponseFollowup = await post("/v1/responses", {
     model: "glm-5.2",
-    previous_response_id: responseApiJson.id,
+    previous_response_id: "resp_upstream",
     input: "Again"
   });
   assert.equal(previousResponseFollowup.status, 200);
   const previousFollowupJson = await previousResponseFollowup.json();
-  assert.equal(previousFollowupJson.previous_response_id, responseApiJson.id);
-  const previousWire = captured.at(-1).payload.messages;
-  assert.equal(previousWire.some((message) => message.role === "system" && message.content === "Be concise."), false);
-  assert.equal(previousWire.at(-2).role, "assistant");
-  assert.equal(previousWire.at(-2).content, "OK");
-  assert.equal(previousWire.at(-1).content, "Again");
+  assert.equal(previousFollowupJson.previous_response_id, "resp_upstream");
+  const previousWire = captured.at(-1);
+  assert.match(previousWire.url, /^\/v1\/responses/);
+  assert.equal(previousWire.payload.previous_response_id, "resp_upstream");
+  assert.equal(previousWire.payload.input, "Again");
+  assert.equal(previousWire.payload.messages, undefined);
 
-  // Responses streaming emits typed Responses SSE events, not chat chunks.
+  // Responses streaming is sanitized and closed on response.completed.
   const streamedResponses = await post("/v1/responses", {
     model: "glm-5.2",
     input: [{ role: "user", content: [{ type: "input_text", text: "Reply OK" }] }],
@@ -609,7 +674,20 @@ try {
   assert.doesNotMatch(responsesSse, /chat\.completion\.chunk/);
   assert.doesNotMatch(responsesSse, /billing[._]summary/);
 
-  // Responses function definitions and tool calls map both directions.
+  const lingerResponsesStartedAt = Date.now();
+  const lingeringResponsesCall = await post("/v1/responses", {
+    model: "test-lingering-responses",
+    input: "x",
+    stream: true
+  });
+  const lingeringResponsesSse = await lingeringResponsesCall.text();
+  const lingerResponsesMs = Date.now() - lingerResponsesStartedAt;
+  assert.equal(lingeringResponsesCall.status, 200);
+  assert.match(lingeringResponsesSse, /response\.completed/);
+  assert.ok(lingerResponsesMs < 2000, `responses stream should end on response.completed, took ${lingerResponsesMs}ms`);
+  assert.doesNotMatch(lingeringResponsesSse, /\n\n\n/);
+
+  // Tools stay in Responses shape on the wire.
   const responseTool = await post("/v1/responses", {
     model: "test-response-tool",
     input: "Weather?",
@@ -620,29 +698,116 @@ try {
       parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
       strict: false
     }],
-    tool_choice: { type: "function", name: "get_weather" },
-    text: { format: { type: "json_schema", name: "weather", schema: { type: "object" }, strict: false } }
+    tool_choice: { type: "function", name: "get_weather" }
   });
   const responseToolJson = await responseTool.json();
   assert.equal(responseTool.status, 200);
   assert.equal(responseToolJson.output[0].type, "function_call");
   assert.equal(responseToolJson.output[0].call_id, "call_weather");
   assert.equal(responseToolJson.output[0].name, "get_weather");
-  assert.equal(responseToolJson.output[0].arguments, '{"city":"Lahore"}');
   const toolWire = captured.at(-1).payload;
-  assert.equal(toolWire.tools[0].function.name, "get_weather");
-  assert.equal(toolWire.tool_choice.function.name, "get_weather");
-  assert.equal(toolWire.response_format.type, "json_schema");
+  assert.equal(toolWire.tools[0].type, "function");
+  assert.equal(toolWire.tools[0].name, "get_weather");
+  assert.equal(toolWire.tools[0].function, undefined);
 
-  // Unsupported Responses-only built-in tools fail explicitly.
-  const unsupportedResponsesTool = await post("/v1/responses", {
+  // Built-in tools are forwarded. The proxy does not reject them.
+  const webSearch = await post("/v1/responses", {
     model: "glm-5.2",
     input: "search",
     tools: [{ type: "web_search" }]
   });
-  assert.equal(unsupportedResponsesTool.status, 400);
-  const unsupportedToolJson = await unsupportedResponsesTool.json();
-  assert.match(unsupportedToolJson.error.message, /cannot be represented by Chat Completions/i);
+  assert.equal(webSearch.status, 200);
+  assert.equal(captured.at(-1).payload.tools[0].type, "web_search");
+
+  const responsesNoAuth = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "glm-5.2", input: "x" })
+  });
+  assert.equal(responsesNoAuth.status, 401);
+  assert.equal(responsesNoAuth.headers.get("www-authenticate"), "Bearer");
+  const responsesNoAuthJson = await responsesNoAuth.json();
+  assert.equal(responsesNoAuthJson.error.type, "authentication_error");
+  assert.equal(responsesNoAuthJson.type, undefined);
+
+  const responsesByGet = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    headers: { authorization: `Bearer ${localKey}` }
+  });
+  assert.equal(responsesByGet.status, 404);
+  const responsesByGetJson = await responsesByGet.json();
+  assert.equal(responsesByGetJson.error.type, "not_found");
+  assert.equal(responsesByGetJson.type, undefined);
+
+  const responsesRate = await post("/v1/responses", { model: "test-rate-responses", input: "x" });
+  const responsesRateJson = await responsesRate.json();
+  assert.equal(responsesRate.status, 429);
+  assert.equal(responsesRate.headers.get("retry-after"), "7");
+  assert.equal(responsesRate.headers.get("x-proxy-original-status"), "403");
+  assert.equal(responsesRateJson.error.type, "rate_limit_error");
+  assert.equal(responsesRateJson.error.code, "rate_limit_exceeded");
+  assert.equal(responsesRateJson.type, undefined);
+
+  const responsesPermanent = await post("/v1/responses", { model: "test-permanent-responses", input: "x" });
+  assert.equal(responsesPermanent.status, 403);
+  assert.equal(responsesPermanent.headers.get("x-proxy-classification"), "permanent-pattern");
+  assert.equal((await responsesPermanent.json()).type, undefined);
+
+  const responsesHtml500 = await post("/v1/responses", { model: "test-500-html-responses", input: "x" });
+  const responsesHtml500Json = await responsesHtml500.json();
+  assert.equal(responsesHtml500.status, 500);
+  assert.equal(responsesHtml500.headers.get("retry-after"), "11");
+  assert.match(responsesHtml500.headers.get("content-type"), /application\/json/);
+  assert.equal(responsesHtml500Json.error.type, "api_error");
+  assert.equal(responsesHtml500Json.type, undefined);
+
+  const responsesEmpty = await post("/v1/responses", { model: "test-empty-responses", input: "x", stream: true });
+  const responsesEmptyJson = await responsesEmpty.json();
+  assert.equal(responsesEmpty.status, 503);
+  assert.equal(responsesEmpty.headers.get("retry-after"), "11");
+  assert.equal(responsesEmpty.headers.get("x-proxy-classification"), "empty-stream");
+  assert.equal(responsesEmptyJson.error.type, "api_error");
+  assert.equal(responsesEmptyJson.type, undefined);
+
+  for (const [model, terminal] of [
+    ["test-lingering-incomplete", "response.incomplete"],
+    ["test-lingering-failed", "response.failed"]
+  ]) {
+    const startedAt = Date.now();
+    const response = await post("/v1/responses", { model, input: "x", stream: true });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(text, new RegExp(terminal.replaceAll(".", "\\.")));
+    assert.ok(Date.now() - startedAt < 2000, `${terminal} stream should end on the terminal frame, took ${Date.now() - startedAt}ms`);
+    assert.doesNotMatch(text, /\n\n\n/);
+  }
+
+  const bogusIdBefore = captured.length;
+  const bogusPrevious = await post("/v1/responses", {
+    model: "glm-5.2",
+    previous_response_id: "resp_bogus_123",
+    input: "Again"
+  });
+  assert.equal(bogusPrevious.status, 200);
+  const bogusPreviousJson = await bogusPrevious.json();
+  assert.notEqual(bogusPrevious.status, 400);
+  assert.ok(!JSON.stringify(bogusPreviousJson).includes("Unknown or expired"));
+  assert.equal(captured[bogusIdBefore].payload.previous_response_id, "resp_bogus_123");
+  assert.match(captured[bogusIdBefore].url, /^\/v1\/responses/);
+
+  const responsesQueryBefore = captured.length;
+  const responsesWithQuery = await post("/v1/responses?foo=bar", {
+    model: "glm-5.2",
+    input: "x"
+  }, {
+    "Anthropic-Version": "2023-06-01",
+    "Anthropic-Beta": "should-not-be-forwarded"
+  });
+  assert.equal(responsesWithQuery.status, 200);
+  const responsesQueryWire = captured[responsesQueryBefore];
+  assert.match(responsesQueryWire.url, /^\/v1\/responses\?foo=bar$/);
+  assert.ok(!responsesQueryWire.url.includes("beta="));
+  assert.equal(responsesQueryWire.headers["anthropic-version"], undefined);
+  assert.equal(responsesQueryWire.headers["anthropic-beta"], undefined);
 
   // 403 quota/rate-limit -> 429, preserving upstream Retry-After.
   const rate = await post("/v1/messages", {
@@ -975,8 +1140,6 @@ try {
   assert.ok(health.stats.droppedSseFrames >= 5);
   assert.ok(health.stats.emptyStreamsRecovered >= 1);
   assert.ok(health.stats.authRejected >= 1);
-  assert.ok(health.stats.responsesBridged >= 4);
-  assert.ok(health.stats.responsesStoreHits >= 1);
 
   // Exact rather than a floor: the suite is hermetic, so the requests it made are
   // every request this process has ever seen. An extra rejection here would mean
