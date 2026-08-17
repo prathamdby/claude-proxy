@@ -12,6 +12,7 @@
 # files containing full prompt text -- cannot be reintroduced by accident.
 .env
 .env.*
+upstreams.json
 *.log
 *.trace
 .git
