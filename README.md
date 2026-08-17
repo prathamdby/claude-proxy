@@ -31,8 +31,14 @@ unauthenticated request to either is still a 401.
 
 `/v1/models` is a straight pass-through: the request goes upstream as it
 arrived, pagination query and all, and the gateway's answer comes back byte for
-byte. The catalogue is therefore whatever your `UPSTREAM_API_KEY` can actually
-reach. The proxy keeps no list of its own.
+byte. The catalogue is therefore whatever the selected upstream can actually
+return. The proxy keeps no list of its own and does not merge catalogues.
+
+Upstreams are tried in JSON array order. A network error, `5xx`, empty SSE
+stream, or retryable SSE error before the first client-visible frame moves to
+the next live upstream. A `429` or any other `4xx` is returned immediately.
+After failover, the failed upstream is skipped for `UPSTREAM_COOLDOWN_MS`;
+`x-proxy-upstream` names the gateway that answered every proxied response.
 
 `/v1/responses` is forwarded to upstream `/v1/responses`. The gateway must
 serve that path. The proxy does not rewrite it to Chat Completions and does
@@ -46,8 +52,9 @@ It is served on a second listener bound to `127.0.0.1:HEALTH_PORT`, the
 container's own loopback, which is never published and never routed by Traefik.
 Nothing outside the container can reach it by construction, and that is why it
 needs no auth: reachability is the control, not a credential. It reports `ok`,
-`version` (the proxy's own, `4.1.0`), `node`, `uptime_seconds`, `upstream` and
-`stats`. `HEALTH_PORT` must differ from `PORT`.
+`version` (the proxy's own, `5.0.0`), `node`, `uptime_seconds`, `upstreams` and
+`stats`. Each upstream entry reports its name, origin, cooldown state and
+request count, never its key. `HEALTH_PORT` must differ from `PORT`.
 
 ## Configuration
 
@@ -65,12 +72,16 @@ before building anything.
 
 ```sh
 cp .env.example .env
-# edit .env: set UPSTREAM_API_KEY to your gateway key, and set ALLOWED_HOSTS to
-# the hostname you will point Claude Code at.
+cp upstreams.example.json upstreams.json
+# edit upstreams.json with your gateways and keys; edit .env so ALLOWED_HOSTS
+# contains the hostname you will point Claude Code at.
 # generate LOCAL_PROXY_KEY — it must be at least 32 characters:
 openssl rand -base64 32
 docker compose up -d
 ```
+
+Create `upstreams.json` before `docker compose up`. If the bind-mount source is
+missing, Docker creates a directory at that path and the proxy refuses to start.
 
 `LOCAL_PROXY_KEY` is the only thing standing between the listener and a paid
 upstream credential, so it has to be unguessable. Startup rejects anything
@@ -113,7 +124,7 @@ Either way, the hostname in `ANTHROPIC_BASE_URL` must be listed in
 
 `ANTHROPIC_AUTH_TOKEN` makes Claude Code send `Authorization: Bearer <token>`,
 which is exactly what this proxy checks. Set it to your **local** proxy key, not
-your gateway key — the gateway key stays in `.env` and never leaves the
+an upstream key — upstream keys stay in `upstreams.json` and never leave the
 container.
 
 ## Environment variables
@@ -128,11 +139,11 @@ Do not quote them — Compose treats quotes in an env file as part of the value.
 | `PORT` | Port inside the container. Keep ≥1024; it runs as a non-root user. | `18989` (1–65535) |
 | `HEALTH_PORT` | Port of the internal `/health` listener, bound to `127.0.0.1` inside the container and never published. Must differ from `PORT`. | `18990` (1–65535) |
 | `ALLOWED_HOSTS` | Hostnames the public listener will answer for. Any other `Host` is a 403. Comma-separated; each entry may be a bare hostname, `host:port` or a full URL — only the hostname is compared. | `claude-proxy.<ip>.nip.io,127.0.0.1,localhost` |
-| `UPSTREAM_BASE_URL` | Gateway every request is forwarded to. `http:`/`https:` only. | `https://anyrouter.top` |
-| `UPSTREAM_API_KEY` | Gateway credential, sent as `Authorization: Bearer`. Bills to your account. | ≥8 chars |
-| `LOCAL_PROXY_KEY` | Secret Claude Code must present to this proxy. The only gate in front of `UPSTREAM_API_KEY`. | ≥32 chars, from `openssl rand -base64 32` |
+| `UPSTREAMS_FILE` | JSON file containing the priority-ordered upstream list. Compose treats this as a host path and mounts it read-only; direct Node runs read the path as given. | `./upstreams.json` |
+| `LOCAL_PROXY_KEY` | Secret Claude Code must present to this proxy. The only gate in front of every upstream key. | ≥32 chars, from `openssl rand -base64 32` |
 | `CLAUDE_CODE_VERSION` | Version in the synthesized `User-Agent`, used only when the caller sends none. | `2.1.197` |
 | `UPSTREAM_TIMEOUT_MS` | Socket timeout per upstream request. Server timeout is this +30000. | `300000` (≥1) |
+| `UPSTREAM_COOLDOWN_MS` | Time a failed-over upstream is skipped before it is eligible again. | `30000` (≥1) |
 | `RETRY_AFTER_SECONDS` | `Retry-After` on 429/5xx when upstream sends none. | `15` (≥1) |
 | `MAX_BODY_BYTES` | Largest accepted request body; bigger gets a 413. | `26214400` (≥1048576) |
 | `PROXY_LOG` | Request logging to stdout. | `true` / `false` |
@@ -153,9 +164,9 @@ The two knobs look alike and behave oppositely at zero.
 
 `PROXY_TRACE=true` writes **full request and response bodies** — your complete
 prompts and the model's complete replies — plus raw SSE frames, in plaintext, to
-`PROXY_TRACE_FILE`. Redaction masks only the two configured keys by exact string
-match, replacing each whole with `[REDACTED:UPSTREAM_API_KEY]` or
-`[REDACTED:LOCAL_PROXY_KEY]` — no leading characters of the secret survive. It
+`PROXY_TRACE_FILE`. Redaction masks every configured upstream key and the local
+key by exact string match, longest first, replacing each whole with an upstream
+name marker or `[REDACTED:LOCAL_PROXY_KEY]` — no leading characters survive. It
 does nothing for prompt content, and it will not catch a credential that happens
 to appear inside a prompt or a reply.
 
@@ -187,8 +198,8 @@ Everything below either guards that key or reduces what reaches it.
 
 - **`LOCAL_PROXY_KEY` must be at least 32 characters**, and startup refuses
   anything shorter, so a short or memorable key cannot reach production by
-  accident. Generate it with `openssl rand -base64 32`. `UPSTREAM_API_KEY` must
-  be at least 8.
+  accident. Generate it with `openssl rand -base64 32`. Every upstream key must
+  be at least 8 characters.
 - **The key comparison is constant-time regardless of key length.** A wrong key
   and a wrong-length key take the same time to reject, so response timing does
   not leak the key byte by byte.
@@ -212,21 +223,22 @@ Everything below either guards that key or reduces what reaches it.
   upstream origin and traffic counters it reports are never exposed publicly.
 - **The trace file is created mode `0600`**, readable only by the user the proxy
   runs as.
-- **Log and trace redaction leaks no prefix.** Both configured keys are replaced
-  whole with `[REDACTED:UPSTREAM_API_KEY]` and `[REDACTED:LOCAL_PROXY_KEY]`; the
+- **Log and trace redaction leaks no prefix.** Every configured key is replaced
+  whole with a named upstream marker or `[REDACTED:LOCAL_PROXY_KEY]`; the
   first characters of a secret are no longer printed alongside the mask, where
   they narrowed the search for anyone reading the logs.
-- **`.env` is never committed and never enters the image.** `.gitignore`
-  excludes it; `.dockerignore` is an allow-list admitting only `proxy.mjs`, so
-  the build context cannot contain a credential to bake into a layer.
+- **Real configuration is never committed and never enters the image.**
+  `.gitignore` excludes `.env` and `upstreams.json`; `.dockerignore` is an
+  allow-list admitting only `proxy.mjs`, so the build context cannot contain a
+  credential to bake into a layer.
 - **The container is hardened**: non-root user, read-only root filesystem, all
   capabilities dropped, `no-new-privileges`, and a single 64 MiB tmpfs at
   `/tmp`.
 - **The image carries no configuration.** It is byte-identical no matter who
   builds it, and fails immediately if run without an env file.
-- Rotate `UPSTREAM_API_KEY` at the gateway — and `LOCAL_PROXY_KEY` here — if it
-  has ever been committed, pasted or shared. Removing a key from a file does not
-  un-expose it.
+- Rotate every exposed upstream key at its gateway, and rotate `LOCAL_PROXY_KEY`
+  here, if any has ever been committed, pasted or shared. Removing a key from a
+  file does not un-expose it.
 
 ### Remote deployment
 
@@ -316,7 +328,7 @@ affected by your shell.
 | 404 on `/health` | It is no longer on the public port. Use `docker compose ps`, or request it from inside the container on `HEALTH_PORT`. |
 | `curl: connection refused` on the host | `HOST` reached the container as `127.0.0.1`. Compose fixes this; check for a stray `HOST` in a compose override. |
 | 401 from the proxy | Claude Code's token does not match `LOCAL_PROXY_KEY`. |
-| 401 from upstream, proxy healthy | `UPSTREAM_API_KEY` is wrong or still the placeholder. |
+| 401 from upstream, proxy healthy | The selected entry's `api_key` in `upstreams.json` is wrong or still a placeholder. |
 | Tracing enabled but the file is empty | `PROXY_TRACE_FILE` points outside `/tmp`; the root filesystem is read-only. |
 
 ## Stopping

@@ -5,8 +5,13 @@
 # Every setting comes from .env. Copy .env.example to .env and fill it in:
 #
 #   cp .env.example .env
-#   # edit .env and fill in the two keys
+#   cp upstreams.example.json upstreams.json
+#   # edit .env and upstreams.json
 #   docker compose up -d
+#
+# The host-side upstreams file must exist before `docker compose up`. Docker
+# creates a directory for a missing bind-mount source, and proxy.mjs rejects
+# that directory with a configuration error.
 #
 # Two independent layers refuse to start on a missing value. Compose itself
 # fails first, via the required-variable interpolation form below, before an
@@ -26,7 +31,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local-api-proxy:4.1.0
+    image: local-api-proxy:5.0.0
 
     restart: unless-stopped
 
@@ -66,11 +71,11 @@ services:
       PORT: "${PORT:?missing in .env - see .env.example}"
       HEALTH_PORT: "${HEALTH_PORT:?missing in .env - see .env.example}"
       ALLOWED_HOSTS: "${ALLOWED_HOSTS:?missing in .env - see .env.example}"
-      UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:?missing in .env - see .env.example}"
-      UPSTREAM_API_KEY: "${UPSTREAM_API_KEY:?missing in .env - see .env.example}"
+      UPSTREAMS_FILE: "/run/local-api-proxy/upstreams.json"
       LOCAL_PROXY_KEY: "${LOCAL_PROXY_KEY:?missing in .env - see .env.example}"
       CLAUDE_CODE_VERSION: "${CLAUDE_CODE_VERSION:?missing in .env - see .env.example}"
       UPSTREAM_TIMEOUT_MS: "${UPSTREAM_TIMEOUT_MS:?missing in .env - see .env.example}"
+      UPSTREAM_COOLDOWN_MS: "${UPSTREAM_COOLDOWN_MS:?missing in .env - see .env.example}"
       RETRY_AFTER_SECONDS: "${RETRY_AFTER_SECONDS:?missing in .env - see .env.example}"
       MAX_BODY_BYTES: "${MAX_BODY_BYTES:?missing in .env - see .env.example}"
       PROXY_LOG: "${PROXY_LOG:?missing in .env - see .env.example}"
@@ -144,6 +149,9 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+    volumes:
+      - "${UPSTREAMS_FILE:?missing in .env - see .env.example}:/run/local-api-proxy/upstreams.json:ro"
 
     # Hardening. The proxy writes nothing except the optional trace file, and
     # both PORT and HEALTH_PORT are above 1024, so it needs no capabilities and

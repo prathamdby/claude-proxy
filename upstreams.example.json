@@ -1,0 +1,12 @@
+[
+  {
+    "name": "primary",
+    "base_url": "https://anyrouter.top",
+    "api_key": "sk-REPLACE-WITH-YOUR-PRIMARY-GATEWAY-KEY"
+  },
+  {
+    "name": "backup",
+    "base_url": "https://backup.example.com",
+    "api_key": "sk-REPLACE-WITH-YOUR-BACKUP-GATEWAY-KEY"
+  }
+]
