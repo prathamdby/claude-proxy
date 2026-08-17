@@ -293,7 +293,6 @@ const proxyEnv = {
   UPSTREAM_API_KEY: testApiKey,
   LOCAL_PROXY_KEY: localKey,
   CLAUDE_CODE_VERSION: "0.0.0-test",
-  UPSTREAM_MODEL: "claude-opus-4-8",
   UPSTREAM_TIMEOUT_MS: "300000",
   RETRY_AFTER_SECONDS: "11",
   MAX_BODY_BYTES: "26214400",

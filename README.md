@@ -32,8 +32,7 @@ unauthenticated request to either is still a 401.
 `/v1/models` is a straight pass-through: the request goes upstream as it
 arrived, pagination query and all, and the gateway's answer comes back byte for
 byte. The catalogue is therefore whatever your `UPSTREAM_API_KEY` can actually
-reach. The proxy keeps no list of its own, and `UPSTREAM_MODEL` appears in the
-result only if the gateway lists it.
+reach. The proxy keeps no list of its own.
 
 `/v1/responses` is forwarded to upstream `/v1/responses`. The gateway must
 serve that path. The proxy does not rewrite it to Chat Completions and does
@@ -133,7 +132,6 @@ Do not quote them — Compose treats quotes in an env file as part of the value.
 | `UPSTREAM_API_KEY` | Gateway credential, sent as `Authorization: Bearer`. Bills to your account. | ≥8 chars |
 | `LOCAL_PROXY_KEY` | Secret Claude Code must present to this proxy. The only gate in front of `UPSTREAM_API_KEY`. | ≥32 chars, from `openssl rand -base64 32` |
 | `CLAUDE_CODE_VERSION` | Version in the synthesized `User-Agent`, used only when the caller sends none. | `2.1.197` |
-| `UPSTREAM_MODEL` | Model used when a request omits `model`. | `claude-opus-4-8` |
 | `UPSTREAM_TIMEOUT_MS` | Socket timeout per upstream request. Server timeout is this +30000. | `300000` (≥1) |
 | `RETRY_AFTER_SECONDS` | `Retry-After` on 429/5xx when upstream sends none. | `15` (≥1) |
 | `MAX_BODY_BYTES` | Largest accepted request body; bigger gets a 413. | `26214400` (≥1048576) |

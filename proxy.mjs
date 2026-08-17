@@ -135,7 +135,6 @@ const config = (() => {
     { minLength: 32, secret: true, pattern: headerValue }
   );
   readText("CLAUDE_CODE_VERSION", "a version string such as 2.1.197", { pattern: headerValue });
-  readText("UPSTREAM_MODEL", "a model id such as claude-opus-4-8");
   readInteger("UPSTREAM_TIMEOUT_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });
   readInteger("RETRY_AFTER_SECONDS", "an integer of at least 1 (seconds)", { min: 1 });
   readInteger("MAX_BODY_BYTES", "an integer of at least 1048576 (1 MiB)", { min: 1024 * 1024 });
@@ -190,7 +189,6 @@ const upstreamBaseUrl = config.UPSTREAM_BASE_URL;
 const apiKey = config.UPSTREAM_API_KEY;
 const localProxyKey = config.LOCAL_PROXY_KEY;
 const claudeCodeVersion = config.CLAUDE_CODE_VERSION;
-const defaultModel = config.UPSTREAM_MODEL;
 const upstreamTimeoutMs = config.UPSTREAM_TIMEOUT_MS;
 const retryAfterSeconds = config.RETRY_AFTER_SECONDS;
 const maxBodyBytes = config.MAX_BODY_BYTES;
@@ -394,6 +392,7 @@ function isAuthorized(req) {
 }
 
 function sendJson(res, status, value, extraHeaders = {}) {
+  if (res.headersSent) return;
   const body = JSON.stringify(value);
   res.writeHead(status, {
     ...extraHeaders,
@@ -464,32 +463,23 @@ function rejectedByHostGuard(req, res, allowedHostnames) {
   return true;
 }
 
-// Every route the proxy serves, each with the one method it answers to. The 404
-// text is derived from the same table so the advertised endpoints cannot drift
-// from the served ones, and a served path reached by the wrong method gets that
-// same 404 rather than a 405: the reply says nothing about which half of the
+// Every route the proxy serves, with its method, wire dialect and delivery flow.
+// The 404 text is derived from the same table so the advertised endpoints cannot
+// drift from the served ones, and a served path reached by the wrong method gets
+// that same 404 rather than a 405: the reply says nothing about which half of the
 // pair a prober guessed right.
-const servedRoutes = new Map([
-  ["/v1/messages", "POST"],
-  ["/v1/messages/count_tokens", "POST"],
-  ["/v1/chat/completions", "POST"],
-  ["/v1/responses", "POST"],
-  ["/v1/models", "GET"]
+const routes = new Map([
+  ["/v1/messages",              { method: "POST", dialect: "anthropic", betaQuery: true,  flow: completeMessage }],
+  ["/v1/messages/count_tokens", { method: "POST", dialect: "anthropic", betaQuery: false, flow: forwardChatRequest }],
+  ["/v1/chat/completions",      { method: "POST", dialect: "openai",    betaQuery: false, flow: forwardChatRequest }],
+  ["/v1/responses",             { method: "POST", dialect: "openai",    betaQuery: false, flow: forwardChatRequest }],
+  ["/v1/models",                { method: "GET",  dialect: "openai",    betaQuery: false, flow: forwardModelCatalogue }]
 ]);
-const servedRoutesMessage = `Supported endpoints: ${[...servedRoutes].map(([path, method]) => `${method} ${path}`).join(", ")}.`;
-
-// Path picks the dialect. /v1/messages and everything under it speak Anthropic.
-// Every other served path speaks OpenAI, including /v1/responses as itself.
-function dialectFor(pathname) {
-  const anthropic = pathname === "/v1/messages" || String(pathname).startsWith("/v1/messages/");
-  return Object.freeze({
-    name: anthropic ? "anthropic" : "openai",
-    addBetaQuery: pathname === "/v1/messages"
-  });
-}
+const servedRoutesMessage = `Supported endpoints: ${[...routes].map(([path, route]) => `${route.method} ${path}`).join(", ")}.`;
 
 function clientErrorShape(requestUrl, type, message, code = undefined) {
-  if (dialectFor(requestUrl?.pathname).name === "openai") {
+  const dialect = routes.get(requestUrl?.pathname)?.dialect || "anthropic";
+  if (dialect === "openai") {
     return { error: { message, type, ...(code ? { code } : {}) } };
   }
   return { type: "error", error: { type, message } };
@@ -525,13 +515,13 @@ function readBody(req) {
   });
 }
 
-function buildUpstreamPath(requestUrl) {
+function buildUpstreamPath(requestUrl, dialect, betaQuery) {
   let pathname = requestUrl.pathname;
   if (upstreamBaseUrl.pathname !== "/") {
     pathname = `${upstreamBaseUrl.pathname.replace(/\/$/, "")}${pathname}`;
   }
   const target = new URL(`${pathname}${requestUrl.search}`, upstreamBaseUrl);
-  if (dialectFor(requestUrl.pathname).addBetaQuery && !target.searchParams.has("beta")) {
+  if (dialect === "anthropic" && betaQuery && !target.searchParams.has("beta")) {
     target.searchParams.set("beta", "true");
   }
   return `${target.pathname}${target.search}`;
@@ -577,7 +567,7 @@ const bareClientDefaults = {
 function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
   const headers = {};
   const omit = new Set(requestHeadersProxyOwns);
-  if (dialect.name === "openai") {
+  if (dialect === "openai") {
     omit.add("anthropic-version");
     omit.add("anthropic-beta");
   }
@@ -595,7 +585,7 @@ function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
 
   headers["x-claude-code-session-id"] = sessionId(sourceHeaders);
   headers.authorization = `Bearer ${apiKey}`;
-  if (dialect.name === "anthropic") {
+  if (dialect === "anthropic") {
     if (headers["anthropic-version"] === undefined) headers["anthropic-version"] = "2023-06-01";
     headers["anthropic-beta"] = mergeBetaHeader(sourceHeaders["anthropic-beta"]);
   }
@@ -605,11 +595,11 @@ function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
   return headers;
 }
 
-function requestUpstream(req, requestUrl, body, wantsStream, onResponse) {
+function requestUpstream(req, requestUrl, body, wantsStream, route, onResponse) {
   const transport = upstreamBaseUrl.protocol === "http:" ? http : https;
   const requestId = req._proxyRequestId || "--------";
-  const upstreamPath = buildUpstreamPath(requestUrl);
-  const upstreamHeaders = safeUpstreamHeaders(req.headers, body.length, wantsStream, dialectFor(requestUrl.pathname));
+  const upstreamPath = buildUpstreamPath(requestUrl, route.dialect, route.betaQuery);
+  const upstreamHeaders = safeUpstreamHeaders(req.headers, body.length, wantsStream, route.dialect);
   const startedRequestAt = Date.now();
 
   log(requestId, "->UP", `${req.method} ${upstreamBaseUrl.origin}${upstreamPath} (${body.length} bytes, stream=${wantsStream})`);
@@ -845,9 +835,14 @@ function sendNetworkError(res, requestUrl, error) {
   sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
 }
 
-function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
+function classifyUpstreamResponse(upstreamRes, bodyText) {
   const status = upstreamRes.statusCode || 502;
-  const classification = errorClassification(status, bodyText);
+  return status < 400 ? null : errorClassification(status, bodyText);
+}
+
+function deliverUpstreamError(res, requestUrl, upstreamRes, bodyText, classification = classifyUpstreamResponse(upstreamRes, bodyText)) {
+  if (res.headersSent) return;
+  const status = upstreamRes.statusCode || 502;
   stats.upstreamErrors += 1;
   log("upstream ", "<-UP", `error ${status} [${classification.kind}/${classification.reason}] ${truncate(bodyText)}`);
 
@@ -896,18 +891,6 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
   headers["content-length"] = Buffer.byteLength(body);
   res.writeHead(status, headers);
   res.end(body);
-}
-
-// The single gate every chat-route upstream response passes through, so each
-// caller below only ever deals with a response the gateway considers
-// successful. The /v1/models pass-through opts out: the gateway owns the
-// catalogue's errors too.
-function handledUpstreamFailure(res, requestUrl, upstreamRes) {
-  if ((upstreamRes.statusCode || 502) < 400) return false;
-  collectResponseBody(upstreamRes)
-    .then((bodyText) => sendUpstreamError(res, requestUrl, upstreamRes, bodyText))
-    .catch((error) => sendNetworkError(res, requestUrl, error));
-  return true;
 }
 
 function applyAnthropicSsePayload(state, payload) {
@@ -978,7 +961,7 @@ function buildCollectedAnthropicMessage(state, requestedModel) {
     id: message.id || `msg_proxy_${crypto.randomUUID().replaceAll("-", "")}`,
     type: "message",
     role: message.role || "assistant",
-    model: message.model || requestedModel || defaultModel,
+    model: message.model || requestedModel,
     content: state.blocks.filter(Boolean),
     stop_reason: state.stopReason || message.stop_reason || "end_turn",
     stop_sequence: state.stopSequence ?? message.stop_sequence ?? null,
@@ -1087,7 +1070,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
   });
 }
 
-function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) {
+function completeMessage(req, res, requestUrl, clientPayload, route) {
   const upstreamBody = Buffer.from(JSON.stringify({ ...clientPayload, stream: true }));
   const state = {
     message: null,
@@ -1101,8 +1084,16 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
   let buffer = "";
   let finalized = false;
 
-  const upstream = requestUpstream(req, requestUrl, upstreamBody, true, (upstreamRes) => {
-    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
+  const upstream = requestUpstream(req, requestUrl, upstreamBody, true, route, (upstreamRes) => {
+    if ((upstreamRes.statusCode || 502) >= 400) {
+      collectResponseBody(upstreamRes)
+        .then((bodyText) => {
+          const classification = classifyUpstreamResponse(upstreamRes, bodyText);
+          if (classification) deliverUpstreamError(res, requestUrl, upstreamRes, bodyText, classification);
+        })
+        .catch((error) => sendNetworkError(res, requestUrl, error));
+      return;
+    }
 
     // Reply as soon as the message is complete. Waiting for the upstream socket
     // to close adds the gateway's full keep-alive idle timeout to every call.
@@ -1155,17 +1146,34 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
   });
 }
 
-function pipeRequest(req, res, requestUrl, body, wantsStream, transparent = false) {
-  const upstream = requestUpstream(req, requestUrl, body, wantsStream, (upstreamRes) => {
-    // A transparent route forwards whatever the gateway answered, errors
-    // included: no classification, no rewrite, no SSE sanitation.
-    if (!transparent && handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
+function forwardChatRequest(req, res, requestUrl, body, wantsStream, route) {
+  const upstream = requestUpstream(req, requestUrl, body, wantsStream, route, (upstreamRes) => {
+    if ((upstreamRes.statusCode || 502) >= 400) {
+      collectResponseBody(upstreamRes)
+        .then((bodyText) => {
+          const classification = classifyUpstreamResponse(upstreamRes, bodyText);
+          if (classification) deliverUpstreamError(res, requestUrl, upstreamRes, bodyText, classification);
+        })
+        .catch((error) => sendNetworkError(res, requestUrl, error));
+      return;
+    }
 
-    if (!transparent && (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream"))) {
+    if (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream")) {
       filteredStreamingResponse(upstreamRes, res, requestUrl);
       return;
     }
 
+    res.writeHead(upstreamRes.statusCode, stripHopByHopHeaders(upstreamRes.headers));
+    upstreamRes.pipe(res);
+    upstreamRes.on("error", (error) => res.destroy(error));
+  });
+  upstream.on("error", (error) => sendNetworkError(res, requestUrl, error));
+}
+
+// The catalogue belongs to the gateway, including its errors. Forward the
+// response byte for byte without classification, rewriting or SSE sanitation.
+function forwardModelCatalogue(req, res, requestUrl, body, wantsStream, route) {
+  const upstream = requestUpstream(req, requestUrl, body, wantsStream, route, (upstreamRes) => {
     res.writeHead(upstreamRes.statusCode, stripHopByHopHeaders(upstreamRes.headers));
     upstreamRes.pipe(res);
     upstreamRes.on("error", (error) => res.destroy(error));
@@ -1235,7 +1243,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (servedRoutes.get(requestUrl.pathname) !== req.method) {
+    const route = routes.get(requestUrl.pathname);
+    if (route?.method !== req.method) {
       sendJson(res, 404, clientErrorShape(requestUrl, "not_found", servedRoutesMessage));
       return;
     }
@@ -1249,9 +1258,9 @@ const server = http.createServer(async (req, res) => {
     // is no body on either leg to read, parse or normalise, which is why this
     // returns before the JSON path below rather than being another branch
     // inside it.
-    if (requestUrl.pathname === "/v1/models") {
+    if (route.flow === forwardModelCatalogue) {
       trace(requestId, "ROUTE", requestUrl.pathname);
-      pipeRequest(req, res, requestUrl, Buffer.alloc(0), false, true);
+      route.flow(req, res, requestUrl, Buffer.alloc(0), false, route);
       return;
     }
 
@@ -1266,10 +1275,11 @@ const server = http.createServer(async (req, res) => {
     const wantsStream = payload.stream === true;
     trace(requestId, "ROUTE", `${requestUrl.pathname} model=${payload.model || "?"} stream=${wantsStream}`);
 
-    if (requestUrl.pathname === "/v1/messages" && !wantsStream) {
-      collectAnthropicStreamingResponse(req, res, requestUrl, payload);
+    if (route.flow === completeMessage && !wantsStream) {
+      route.flow(req, res, requestUrl, payload, route);
     } else {
-      pipeRequest(req, res, requestUrl, body, wantsStream);
+      const flow = route.flow === completeMessage ? forwardChatRequest : route.flow;
+      flow(req, res, requestUrl, body, wantsStream, route);
     }
   } catch (error) {
     sendHttpError(res, requestUrl, error);
