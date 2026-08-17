@@ -137,8 +137,10 @@ const config = (() => {
 
       const upstreamName = typeof entry.name === "string" ? entry.name.trim() : undefined;
       let validName = true;
-      if (!upstreamName || /[\u0000-\u001f\u007f]/.test(upstreamName)) {
-        invalid(`${prefix}.name`, "a non-empty name without control characters", upstreamName);
+      // Names are written to x-proxy-upstream; Node rejects header values outside
+      // printable ASCII, so the same headerValue floor used for api_key applies.
+      if (!upstreamName || !headerValue.test(upstreamName)) {
+        invalid(`${prefix}.name`, "a non-empty printable ASCII name", upstreamName);
         validName = false;
       } else if (seenNames.has(upstreamName)) {
         problems.push(`${prefix}.name: expected a unique name, but ${JSON.stringify(upstreamName)} is duplicated`);
@@ -279,6 +281,16 @@ const upstreamTimeoutMs = config.UPSTREAM_TIMEOUT_MS;
 const cooldownMs = config.UPSTREAM_COOLDOWN_MS;
 const retryAfterSeconds = config.RETRY_AFTER_SECONDS;
 const maxBodyBytes = config.MAX_BODY_BYTES;
+// Sorted once at startup: upstreams and LOCAL_PROXY_KEY never change after boot,
+// and redactSecrets runs on every log line plus every traced SSE chunk.
+const redactedSecrets = [
+  ...upstreams.map((upstream) => [`UPSTREAM:${upstream.name}`, upstream.apiKey]),
+  ["LOCAL_PROXY_KEY", localProxyKey]
+].sort((left, right) => right[1].length - left[1].length);
+
+function isClientAbort(error) {
+  return Boolean(error && error.code === "PROXY_CLIENT_ABORT");
+}
 
 // Betas the gateway is asked for on top of whatever the client sent. Claude Code
 // already sends most of these; context-1m-2025-08-07 and web-search-2025-03-05 are
@@ -398,11 +410,7 @@ function redactSecrets(value) {
   // put real key bytes into the console log and the trace file, which is the one
   // thing this function exists to keep out of them. The length floor is a safety
   // net: a pathologically short secret would otherwise match everywhere.
-  const secrets = [
-    ...upstreams.map((upstream) => [`UPSTREAM:${upstream.name}`, upstream.apiKey]),
-    ["LOCAL_PROXY_KEY", localProxyKey]
-  ].sort((left, right) => right[1].length - left[1].length);
-  for (const [name, secret] of secrets) {
+  for (const [name, secret] of redactedSecrets) {
     if (secret && secret.length > 3) text = text.split(secret).join(`[REDACTED:${name}]`);
   }
   return text;
@@ -918,7 +926,7 @@ function sendRetryableProxyError(res, requestUrl, status, message, extraHeaders 
 }
 
 function sendNetworkError(res, requestUrl, error) {
-  stats.networkErrors += 1;
+  if (!isClientAbort(error)) stats.networkErrors += 1;
   const message = error instanceof Error ? error.message : String(error);
   sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
 }
@@ -1107,7 +1115,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl, upstream, canFa
         sendRetryableProxyError(res, requestUrl, earlyError.status, earlyError.message, {
           "x-proxy-classification": "sse-error-before-first-token"
         });
-        finish({ kind: "delivered", healthy: false });
+        finish({ kind: "delivered", healthy: false, cool: earlyError.status === 503 });
         upstreamRes.destroy();
         return;
       }
@@ -1154,7 +1162,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl, upstream, canFa
       sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream. Retrying is safe.", {
         "x-proxy-classification": "empty-stream"
       });
-      finish({ kind: "delivered", healthy: false });
+      finish({ kind: "delivered", healthy: false, cool: true });
       return;
     }
     if (!started) startResponse();
@@ -1163,15 +1171,15 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl, upstream, canFa
 
   upstreamRes.on("error", (error) => {
     if (finished) return;
-    stats.networkErrors += 1;
+    if (!isClientAbort(error)) stats.networkErrors += 1;
     if (!started) {
-      if (canFailover) {
+      if (canFailover && !isClientAbort(error)) {
         finish({ kind: "failover", reason: "response-stream-error" });
         return;
       }
       res.setHeader("x-proxy-upstream", upstream.name);
       sendRetryableProxyError(res, requestUrl, 503, `Upstream stream failed before first event: ${error.message}`);
-      finish({ kind: "delivered", healthy: false });
+      finish({ kind: "delivered", healthy: false, cool: !isClientAbort(error) });
     } else {
       res.destroy(error);
     }
@@ -1205,11 +1213,11 @@ function completeMessage(upstreamRes, res, requestUrl, body, upstream, canFailov
       } else if (status) {
         res.setHeader("x-proxy-upstream", upstream.name);
         sendRetryableProxyError(res, requestUrl, status, message || transientSseErrorMessage);
-        finish({ kind: "delivered", healthy: false });
+        finish({ kind: "delivered", healthy: false, cool: status === 503 });
       } else {
         res.setHeader("x-proxy-upstream", upstream.name);
         sendJson(res, 502, clientErrorShape(requestUrl, "api_error", message || "Upstream stream returned an error."));
-        finish({ kind: "delivered", healthy: false });
+        finish({ kind: "delivered", healthy: false, cool: true });
       }
       return;
     }
@@ -1221,7 +1229,7 @@ function completeMessage(upstreamRes, res, requestUrl, body, upstream, canFailov
       }
       res.setHeader("x-proxy-upstream", upstream.name);
       sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream while collecting a non-streaming response.");
-      finish({ kind: "delivered", healthy: false });
+      finish({ kind: "delivered", healthy: false, cool: true });
       return;
     }
     res.setHeader("x-proxy-upstream", upstream.name);
@@ -1249,13 +1257,13 @@ function completeMessage(upstreamRes, res, requestUrl, body, upstream, canFailov
   upstreamRes.on("error", (error) => {
     if (finalized) return;
     if (canFailover) {
-      stats.networkErrors += 1;
+      if (!isClientAbort(error)) stats.networkErrors += 1;
       finalized = true;
       finish({ kind: "failover", reason: "response-stream-error" });
     } else {
       res.setHeader("x-proxy-upstream", upstream.name);
       sendNetworkError(res, requestUrl, error);
-      finish({ kind: "delivered", healthy: false });
+      finish({ kind: "delivered", healthy: false, cool: !isClientAbort(error) });
     }
   });
 }
@@ -1279,7 +1287,11 @@ function forwardModelCatalogue(upstreamRes, res, _requestUrl, _body, upstream, _
   const headers = stripHopByHopHeaders(upstreamRes.headers);
   headers["x-proxy-upstream"] = upstream.name;
   res.writeHead(upstreamRes.statusCode, headers);
-  finish({ kind: "committed", healthy: (upstreamRes.statusCode || 502) < 400 });
+  finish({
+    kind: "committed",
+    healthy: (upstreamRes.statusCode || 502) < 400,
+    cool: (upstreamRes.statusCode || 502) >= 500
+  });
   upstreamRes.pipe(res);
   upstreamRes.on("error", (error) => res.destroy(error));
 }
@@ -1300,8 +1312,10 @@ function attemptUpstream(req, res, requestUrl, body, wantsStream, route, upstrea
 
     const clientClosed = () => {
       if (outcomeKind === "delivered") return;
-      upstreamReq?.destroy(new Error("Client aborted request."));
-      upstreamRes?.destroy(new Error("Client aborted request."));
+      const abortError = new Error("Client aborted request.");
+      abortError.code = "PROXY_CLIENT_ABORT";
+      upstreamReq?.destroy(abortError);
+      upstreamRes?.destroy(abortError);
       if (!settled) finish({ kind: "delivered", healthy: false });
     };
     req.once("aborted", clientClosed);
@@ -1322,15 +1336,15 @@ function attemptUpstream(req, res, requestUrl, body, wantsStream, route, upstrea
 
     const networkFailure = (error, reason) => {
       if (settled) return;
-      stats.networkErrors += 1;
-      if (canFailover) {
+      if (!isClientAbort(error)) stats.networkErrors += 1;
+      if (canFailover && !isClientAbort(error)) {
         finish({ kind: "failover", reason });
         return;
       }
       res.setHeader("x-proxy-upstream", upstream.name);
       const message = error instanceof Error ? error.message : String(error);
       sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
-      finish({ kind: "delivered", healthy: false });
+      finish({ kind: "delivered", healthy: false, cool: !isClientAbort(error) });
     };
 
     upstream.requests += 1;
@@ -1352,7 +1366,7 @@ function attemptUpstream(req, res, requestUrl, body, wantsStream, route, upstrea
           const classification = classifyUpstreamResponse(response, bodyText);
           res.setHeader("x-proxy-upstream", upstream.name);
           deliverUpstreamError(res, requestUrl, response, bodyText, classification);
-          finish({ kind: "delivered", healthy: status < 400 });
+          finish({ kind: "delivered", healthy: false, cool: status >= 500 });
         } catch (error) {
           networkFailure(error, "response-stream-error");
         }
@@ -1371,13 +1385,14 @@ async function proxyRequest(req, res, requestUrl, body, wantsStream, route) {
     const upstream = order[index];
     const canFailover = index < order.length - 1 && Date.now() < deadline;
     const outcome = await attemptUpstream(req, res, requestUrl, body, wantsStream, route, upstream, canFailover);
-    if (outcome.kind !== "failover") {
-      if (outcome.healthy) upstream.coolUntil = 0;
-      return;
+    if (outcome.kind === "failover" || outcome.cool) {
+      upstream.coolUntil = Date.now() + cooldownMs;
+      upstream.failovers += 1;
+      stats.failovers += 1;
     }
-    upstream.coolUntil = Date.now() + cooldownMs;
-    upstream.failovers += 1;
-    stats.failovers += 1;
+    if (outcome.kind === "failover") continue;
+    if (outcome.healthy) upstream.coolUntil = 0;
+    return;
   }
 }
 
@@ -1525,7 +1540,8 @@ const healthServer = http.createServer((req, res) => {
       origin: upstream.baseUrl.origin,
       cooling: upstream.coolUntil > Date.now(),
       cool_until: upstream.coolUntil || null,
-      requests: upstream.requests
+      requests: upstream.requests,
+      failovers: upstream.failovers
     })),
     stats: { ...stats }
   });

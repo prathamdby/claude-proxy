@@ -53,8 +53,9 @@ container's own loopback, which is never published and never routed by Traefik.
 Nothing outside the container can reach it by construction, and that is why it
 needs no auth: reachability is the control, not a credential. It reports `ok`,
 `version` (the proxy's own, `5.0.0`), `node`, `uptime_seconds`, `upstreams` and
-`stats`. Each upstream entry reports its name, origin, cooldown state and
-request count, never its key. `HEALTH_PORT` must differ from `PORT`.
+`stats`. Each upstream entry reports its name, origin, cooldown state,
+request count and failover count, never its key. `HEALTH_PORT` must differ from
+`PORT`.
 
 ## Configuration
 
@@ -82,6 +83,10 @@ docker compose up -d
 
 Create `upstreams.json` before `docker compose up`. If the bind-mount source is
 missing, Docker creates a directory at that path and the proxy refuses to start.
+Prefer `chmod 600 upstreams.json` on the host — the file holds every upstream key
+in plaintext. The container reads it as uid 1000 (`USER node`), so `0600` owned
+by a different host uid fails startup with `EACCES`, which looks like a missing
+file rather than a permissions choice.
 
 `LOCAL_PROXY_KEY` is the only thing standing between the listener and a paid
 upstream credential, so it has to be unguessable. Startup rejects anything
@@ -321,7 +326,7 @@ affected by your shell.
 
 | Symptom | Cause |
 | --- | --- |
-| Compose exits with `missing in .env` | A variable is unset or empty. Compare `.env` against `.env.example`. |
+| Compose exits with `missing in .env` | A variable is unset or empty. Compare `.env` against `.env.example`. After 4.x → 5.0.0, `UPSTREAM_BASE_URL` / `UPSTREAM_API_KEY` / `UPSTREAM_MODEL` are gone; set `UPSTREAMS_FILE` and create `upstreams.json` instead. |
 | Container restart-loops, logs list variables | The proxy's own validation rejected a value's type or range. The message names each one. Common after an upgrade: `LOCAL_PROXY_KEY` under 32 characters, or `HEALTH_PORT` equal to `PORT`. |
 | **403 on every request** | The hostname in `ANTHROPIC_BASE_URL` is not in `ALLOWED_HOSTS` — the most likely failure after upgrading. Add it as a bare hostname, without scheme or port, and restart. `127.0.0.1` and `localhost` do not cover each other. |
 | 403 from a browser or a web page | The browser guard rejected an `origin` or `sec-fetch-site` header. This proxy serves CLI clients only. |

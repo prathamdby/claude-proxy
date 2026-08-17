@@ -250,6 +250,23 @@ const upstream = http.createServer((req, res) => {
           res.writeHead(500, { "content-type": "text/plain" });
           res.end("primary down");
           return;
+        case "test-failover-empty-stream":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: ping\ndata: null\n\n');
+          return;
+        case "test-failover-sse-503":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"primary overloaded"}}\n\n');
+          return;
+        case "test-no-failover-sse-429":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"primary rate limited"}}\n\n');
+          return;
+        case "test-failover-after-first":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hi"}\n\n');
+          setTimeout(() => res.socket.destroy(), 20);
+          return;
         case "test-rate-responses":
           res.writeHead(403, { "content-type": "application/json", "retry-after": "7" });
           res.end(JSON.stringify({ error: { type: "gateway_error", message: "quota exceeded for this key" } }));
@@ -314,6 +331,27 @@ const upstream = http.createServer((req, res) => {
         res.end("primary down");
         return;
       }
+      if (payload.model === "test-failover-empty-stream") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end('event: ping\ndata: null\n\n');
+        return;
+      }
+      if (payload.model === "test-failover-sse-503") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"primary overloaded"}}\n\n');
+        return;
+      }
+      if (payload.model === "test-no-failover-sse-429") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end('event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"primary rate limited"}}\n\n');
+        return;
+      }
+      if (payload.model === "test-failover-after-first") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"id":"chat_partial","object":"chat.completion.chunk","model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}\n\n');
+        setTimeout(() => res.socket.destroy(), 20);
+        return;
+      }
       if (payload.model === "test-rate-openai") {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "用户额度不足", type: "gateway_error" } }));
@@ -324,7 +362,7 @@ const upstream = http.createServer((req, res) => {
     }
 
     if (req.url.startsWith("/v1/models")) {
-      if (req.url.includes("failprimary=1")) {
+      if (req.url.includes("failall=1") || req.url.includes("failprimary=1")) {
         res.writeHead(500, { "content-type": "text/plain" });
         res.end("primary down");
         return;
@@ -368,7 +406,7 @@ function createBackupUpstream(name, requests) {
         "test-500-html", "test-empty", "test-sse-error", "test-sse-error-typed",
         "test-500-html-responses", "test-empty-responses", "test-all-down"
       ]);
-      if (preserveFailure.has(payload.model) || req.url.includes("force500html")) {
+      if (preserveFailure.has(payload.model) || req.url.includes("force500html") || req.url.includes("failall=1")) {
         if (payload.model?.includes("empty")) {
           res.writeHead(200, { "content-type": "text/event-stream" });
           res.end('event: ping\ndata: null\n\n');
@@ -1262,6 +1300,12 @@ try {
   assert.equal(failover500.headers.get("x-proxy-upstream"), "secondary");
   assert.match(await failover500.text(), /SECONDARY/);
 
+  const healthWhileCooling = await (await fetch(`http://127.0.0.1:${healthPort}/health`)).json();
+  assert.equal(healthWhileCooling.upstreams[0].cooling, true);
+  assert.ok(healthWhileCooling.upstreams[0].cool_until > Date.now());
+  assert.ok(healthWhileCooling.upstreams[0].failovers >= 1);
+  assert.ok(healthWhileCooling.stats.failovers >= 1);
+
   const primaryBeforeCooldownSkip = captured.length;
   const cooldownSkip = await post("/v1/messages", {
     model: "claude-opus-4-8",
@@ -1368,6 +1412,43 @@ try {
     assert.equal(response.headers.get("x-proxy-upstream"), "secondary");
   }
 
+  for (const [path, payload] of [
+    ["/v1/chat/completions", { model: "test-failover-empty-stream", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/chat/completions", { model: "test-failover-sse-503", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/responses", { model: "test-failover-empty-stream", input: "x", stream: true }],
+    ["/v1/responses", { model: "test-failover-sse-503", input: "x", stream: true }]
+  ]) {
+    await waitForCooldown();
+    const response = await post(path, payload);
+    assert.equal(response.status, 200, `${path} ${payload.model} did not fail over`);
+    assert.equal(response.headers.get("x-proxy-upstream"), "secondary");
+  }
+
+  for (const [path, payload] of [
+    ["/v1/chat/completions", { model: "test-no-failover-sse-429", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/responses", { model: "test-no-failover-sse-429", input: "x", stream: true }]
+  ]) {
+    await waitForCooldown();
+    const backupBefore = secondaryCaptured.length + thirdCaptured.length;
+    const response = await post(path, payload);
+    assert.equal(response.status, 429, `${path} sse 429 status`);
+    assert.equal(response.headers.get("x-proxy-upstream"), "primary");
+    assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBefore, `${path} sse 429 incorrectly failed over`);
+  }
+
+  for (const [path, payload] of [
+    ["/v1/chat/completions", { model: "test-failover-after-first", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/responses", { model: "test-failover-after-first", input: "x", stream: true }]
+  ]) {
+    await waitForCooldown();
+    const backupBefore = secondaryCaptured.length + thirdCaptured.length;
+    const response = await post(path, payload);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-proxy-upstream"), "primary");
+    await assert.rejects(response.text());
+    assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBefore, `${path} committed stream failed over`);
+  }
+
   await waitForCooldown();
   const modelsFailover = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?failprimary=1`, { headers: { authorization: `Bearer ${localKey}` } });
   assert.equal(modelsFailover.status, 200);
@@ -1383,6 +1464,31 @@ try {
   assert.equal(allDown.status, 500);
   assert.equal(allDown.headers.get("x-proxy-upstream"), "third");
   assert.equal((await allDown.json()).error.type, "api_error");
+
+  await waitForCooldown();
+  const allDownMessages = await post("/v1/messages", {
+    model: "test-all-down",
+    stream: false,
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(allDownMessages.status, 500);
+  assert.equal(allDownMessages.headers.get("x-proxy-upstream"), "third");
+
+  await waitForCooldown();
+  const allDownModels = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?failall=1`, { headers: { authorization: `Bearer ${localKey}` } });
+  assert.equal(allDownModels.status, 500);
+  assert.equal(allDownModels.headers.get("x-proxy-upstream"), "third");
+
+  // Last-upstream cooling lets the all-cooling fallback retry the primary
+  // immediately instead of pinning traffic to a dead final gateway.
+  const pinRecovery = await post("/v1/messages", {
+    model: "claude-opus-4-8",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(pinRecovery.status, 200);
+  assert.equal(pinRecovery.headers.get("x-proxy-upstream"), "primary");
 
   await waitForCooldown();
   const secondaryBeforeDestroyedResponse = secondaryCaptured.length;
@@ -1717,6 +1823,38 @@ try {
   assert.match(shortUpstreamKey.stderr, /UPSTREAMS_FILE\[0\]\.api_key: expected at least 8 printable ASCII characters/);
   assert.match(shortUpstreamKey.stderr, /1 configuration problem\./);
   assert.doesNotMatch(shortUpstreamKey.stderr, new RegExp(shortSecret));
+
+  const nonObjectEntrySecret = "NonObjectEntrySecret99";
+  const nonObjectEntry = await runProxyToExit(envWithUpstreams([null]));
+  assert.notEqual(nonObjectEntry.code, 0);
+  assert.match(nonObjectEntry.stderr, /UPSTREAMS_FILE\[0\]: expected an object with exactly name, base_url and api_key/);
+  assert.doesNotMatch(nonObjectEntry.stderr, new RegExp(nonObjectEntrySecret));
+
+  const extraKeySecret = "ExtraKeySecretValue88";
+  const extraKey = await runProxyToExit(envWithUpstreams([
+    { name: "extra", base_url: "https://gateway.example", api_key: extraKeySecret, region: "us" }
+  ]));
+  assert.notEqual(extraKey.code, 0);
+  assert.match(extraKey.stderr, /UPSTREAMS_FILE\[0\]: expected exactly the keys name, base_url and api_key/);
+  assert.doesNotMatch(extraKey.stderr, new RegExp(extraKeySecret));
+
+  const missingKey = await runProxyToExit(envWithUpstreams([
+    { name: "missing", base_url: "https://gateway.example" }
+  ]));
+  assert.notEqual(missingKey.code, 0);
+  assert.match(missingKey.stderr, /UPSTREAMS_FILE\[0\]: expected exactly the keys name, base_url and api_key/);
+
+  const emptyName = await runProxyToExit(envWithUpstreams([
+    { name: "   ", base_url: "https://gateway.example", api_key: "ValidKeyForEmptyName" }
+  ]));
+  assert.notEqual(emptyName.code, 0);
+  assert.match(emptyName.stderr, /UPSTREAMS_FILE\[0\]\.name: expected a non-empty printable ASCII name/);
+
+  const nonAsciiName = await runProxyToExit(envWithUpstreams([
+    { name: "主要", base_url: "https://gateway.example", api_key: "ValidKeyForNonAscii" }
+  ]));
+  assert.notEqual(nonAsciiName.code, 0);
+  assert.match(nonAsciiName.stderr, /UPSTREAMS_FILE\[0\]\.name: expected a non-empty printable ASCII name/);
 
   // Present but unusable fails the same way, and a rejected secret is never
   // echoed back into stderr -- stderr ends up in container logs. This value is
