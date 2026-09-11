@@ -5,6 +5,7 @@
 .envrc
 *.env
 secrets/
+upstreams.json
 *.pem
 *.key
 *.crt

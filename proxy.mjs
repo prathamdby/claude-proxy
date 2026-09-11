@@ -69,8 +69,7 @@ const config = (() => {
     values[name] = value === "true";
   };
 
-  const readUrl = (name, expected) => {
-    const value = read(name);
+  const parseHttpUrl = (value) => {
     let parsed = null;
     if (value) {
       try {
@@ -80,10 +79,89 @@ const config = (() => {
       }
     }
     // Anything but http:/https: would silently fall through to the https agent.
-    if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
-      return invalid(name, expected, value);
+    return parsed && (parsed.protocol === "http:" || parsed.protocol === "https:") ? parsed : null;
+  };
+
+  const readUpstreamsFile = () => {
+    const name = "UPSTREAMS_FILE";
+    const expected = "a readable regular JSON file containing at least one upstream";
+    const filePath = read(name);
+    if (!filePath) return invalid(name, expected, filePath);
+
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch (error) {
+      problems.push(`${name}: expected ${expected}, but ${JSON.stringify(filePath)} cannot be read: ${error.message}`);
+      return;
     }
-    values[name] = parsed;
+    if (!stat.isFile()) {
+      problems.push(`${name}: expected ${expected}, but ${JSON.stringify(filePath)} is not a regular file`);
+      return;
+    }
+
+    let contents;
+    try {
+      contents = fs.readFileSync(filePath, "utf8");
+    } catch (error) {
+      problems.push(`${name}: expected ${expected}, but ${JSON.stringify(filePath)} cannot be read: ${error.message}`);
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(contents);
+    } catch (error) {
+      problems.push(`${name}: expected valid JSON, but ${JSON.stringify(filePath)} could not be parsed: ${error.message}`);
+      return;
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      problems.push(`${name}: expected a non-empty JSON array of upstreams`);
+      return;
+    }
+
+    const seenNames = new Set();
+    const upstreams = [];
+    for (let index = 0; index < parsed.length; index += 1) {
+      const entry = parsed[index];
+      const prefix = `${name}[${index}]`;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        problems.push(`${prefix}: expected an object with exactly name, base_url and api_key`);
+        continue;
+      }
+      const keys = Object.keys(entry).sort();
+      if (keys.join(",") !== "api_key,base_url,name") {
+        problems.push(`${prefix}: expected exactly the keys name, base_url and api_key`);
+        continue;
+      }
+
+      const upstreamName = typeof entry.name === "string" ? entry.name.trim() : undefined;
+      let validName = true;
+      // Names are written to x-proxy-upstream; Node rejects header values outside
+      // printable ASCII, so the same headerValue floor used for api_key applies.
+      if (!upstreamName || !headerValue.test(upstreamName)) {
+        invalid(`${prefix}.name`, "a non-empty printable ASCII name", upstreamName);
+        validName = false;
+      } else if (seenNames.has(upstreamName)) {
+        problems.push(`${prefix}.name: expected a unique name, but ${JSON.stringify(upstreamName)} is duplicated`);
+        validName = false;
+      } else {
+        seenNames.add(upstreamName);
+      }
+
+      const baseUrl = typeof entry.base_url === "string" ? parseHttpUrl(entry.base_url.trim()) : null;
+      if (!baseUrl) invalid(`${prefix}.base_url`, "an absolute http:// or https:// URL", entry.base_url);
+
+      const apiKey = typeof entry.api_key === "string" ? entry.api_key : undefined;
+      const validApiKey = typeof apiKey === "string"
+        && apiKey.length >= 8
+        && !/[\u0000-\u001f\u007f]/.test(apiKey)
+        && headerValue.test(apiKey);
+      if (!validApiKey) invalid(`${prefix}.api_key`, "at least 8 printable ASCII characters", apiKey, true);
+
+      if (validName && upstreamName && baseUrl && validApiKey) upstreams.push({ name: upstreamName, baseUrl, apiKey });
+    }
+    if (upstreams.length === parsed.length) values.UPSTREAMS = upstreams;
   };
 
   // The operator fills this in by copying the host out of the ANTHROPIC_BASE_URL
@@ -124,8 +202,7 @@ const config = (() => {
     "ALLOWED_HOSTS",
     "a comma-separated list of hosts this proxy answers to, such as 127.0.0.1,claude-proxy.203.0.113.10.nip.io"
   );
-  readUrl("UPSTREAM_BASE_URL", "an absolute http:// or https:// URL");
-  readText("UPSTREAM_API_KEY", "at least 8 characters of upstream gateway key", { minLength: 8, secret: true, pattern: headerValue });
+  readUpstreamsFile();
   // This key is the only thing standing between the public internet and a paid
   // upstream credential, so it has to be generated rather than chosen: a short
   // placeholder is a giveaway once the port is reachable from anywhere.
@@ -135,8 +212,8 @@ const config = (() => {
     { minLength: 32, secret: true, pattern: headerValue }
   );
   readText("CLAUDE_CODE_VERSION", "a version string such as 2.1.197", { pattern: headerValue });
-  readText("UPSTREAM_MODEL", "a model id such as claude-opus-4-8");
   readInteger("UPSTREAM_TIMEOUT_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });
+  readInteger("UPSTREAM_COOLDOWN_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });
   readInteger("RETRY_AFTER_SECONDS", "an integer of at least 1 (seconds)", { min: 1 });
   readInteger("MAX_BODY_BYTES", "an integer of at least 1048576 (1 MiB)", { min: 1024 * 1024 });
   readBoolean("PROXY_LOG", "console request logging");
@@ -154,18 +231,22 @@ const config = (() => {
   if (values.PORT !== undefined && values.HEALTH_PORT !== undefined && values.PORT === values.HEALTH_PORT) {
     problems.push(`HEALTH_PORT: expected a port of its own, but it is ${values.HEALTH_PORT}, the same port as PORT`);
   }
-  // The whole point of the local key is that the upstream credential never
-  // leaves this process; reusing it as the client-facing key hands it out.
-  if (values.LOCAL_PROXY_KEY !== undefined && values.UPSTREAM_API_KEY !== undefined && values.LOCAL_PROXY_KEY === values.UPSTREAM_API_KEY) {
-    problems.push("LOCAL_PROXY_KEY: expected a secret of its own, but it is the same value as UPSTREAM_API_KEY (the value received is not shown)");
+  // The whole point of the local key is that upstream credentials never leave
+  // this process; reusing one as the client-facing key hands it out.
+  if (values.LOCAL_PROXY_KEY !== undefined && values.UPSTREAMS !== undefined) {
+    for (let index = 0; index < values.UPSTREAMS.length; index += 1) {
+      if (values.LOCAL_PROXY_KEY === values.UPSTREAMS[index].apiKey) {
+        problems.push(`UPSTREAMS_FILE[${index}].api_key: expected a secret different from LOCAL_PROXY_KEY (the value received is not shown)`);
+      }
+    }
   }
 
   if (problems.length > 0) {
     const report = [
-      `Local API Proxy cannot start: ${problems.length} environment variable problem${problems.length === 1 ? "" : "s"}.`,
-      "Every variable is required and none of them has a default value.",
+      `Local API Proxy cannot start: ${problems.length} configuration problem${problems.length === 1 ? "" : "s"}.`,
+      "Every setting is required and none of them has a default value.",
       ...problems.map((problem) => `  - ${problem}`),
-      "Set every variable listed above and start the proxy again.",
+      "Fix every setting listed above and start the proxy again.",
       ""
     ].join("\n");
     // Written synchronously: process.exit() can truncate a piped stderr write.
@@ -184,16 +265,32 @@ const host = config.HOST;
 const port = config.PORT;
 const healthPort = config.HEALTH_PORT;
 const allowedHosts = config.ALLOWED_HOSTS;
-const proxyVersion = "4.1.0";
+const proxyVersion = "5.0.0";
 const nodeRuntimeVersion = process.version;
-const upstreamBaseUrl = config.UPSTREAM_BASE_URL;
-const apiKey = config.UPSTREAM_API_KEY;
+const upstreams = config.UPSTREAMS.map(({ name, baseUrl, apiKey }) => ({
+  name,
+  baseUrl,
+  apiKey,
+  coolUntil: 0,
+  requests: 0,
+  failovers: 0
+}));
 const localProxyKey = config.LOCAL_PROXY_KEY;
 const claudeCodeVersion = config.CLAUDE_CODE_VERSION;
-const defaultModel = config.UPSTREAM_MODEL;
 const upstreamTimeoutMs = config.UPSTREAM_TIMEOUT_MS;
+const cooldownMs = config.UPSTREAM_COOLDOWN_MS;
 const retryAfterSeconds = config.RETRY_AFTER_SECONDS;
 const maxBodyBytes = config.MAX_BODY_BYTES;
+// Sorted once at startup: upstreams and LOCAL_PROXY_KEY never change after boot,
+// and redactSecrets runs on every log line plus every traced SSE chunk.
+const redactedSecrets = [
+  ...upstreams.map((upstream) => [`UPSTREAM:${upstream.name}`, upstream.apiKey]),
+  ["LOCAL_PROXY_KEY", localProxyKey]
+].sort((left, right) => right[1].length - left[1].length);
+
+function isClientAbort(error) {
+  return Boolean(error && error.code === "PROXY_CLIENT_ABORT");
+}
 
 // Betas the gateway is asked for on top of whatever the client sent. Claude Code
 // already sends most of these; context-1m-2025-08-07 and web-search-2025-03-05 are
@@ -294,6 +391,7 @@ const stats = {
   retryablePassed: 0,
   permanentPassed: 0,
   networkErrors: 0,
+  failovers: 0,
   droppedSseFrames: 0,
   emptyStreamsRecovered: 0,
   streamsClosedOnTerminalFrame: 0,
@@ -312,7 +410,7 @@ function redactSecrets(value) {
   // put real key bytes into the console log and the trace file, which is the one
   // thing this function exists to keep out of them. The length floor is a safety
   // net: a pathologically short secret would otherwise match everywhere.
-  for (const [name, secret] of [["UPSTREAM_API_KEY", apiKey], ["LOCAL_PROXY_KEY", localProxyKey]]) {
+  for (const [name, secret] of redactedSecrets) {
     if (secret && secret.length > 3) text = text.split(secret).join(`[REDACTED:${name}]`);
   }
   return text;
@@ -394,6 +492,7 @@ function isAuthorized(req) {
 }
 
 function sendJson(res, status, value, extraHeaders = {}) {
+  if (res.headersSent) return;
   const body = JSON.stringify(value);
   res.writeHead(status, {
     ...extraHeaders,
@@ -464,32 +563,23 @@ function rejectedByHostGuard(req, res, allowedHostnames) {
   return true;
 }
 
-// Every route the proxy serves, each with the one method it answers to. The 404
-// text is derived from the same table so the advertised endpoints cannot drift
-// from the served ones, and a served path reached by the wrong method gets that
-// same 404 rather than a 405: the reply says nothing about which half of the
+// Every route the proxy serves, with its method, wire dialect and delivery flow.
+// The 404 text is derived from the same table so the advertised endpoints cannot
+// drift from the served ones, and a served path reached by the wrong method gets
+// that same 404 rather than a 405: the reply says nothing about which half of the
 // pair a prober guessed right.
-const servedRoutes = new Map([
-  ["/v1/messages", "POST"],
-  ["/v1/messages/count_tokens", "POST"],
-  ["/v1/chat/completions", "POST"],
-  ["/v1/responses", "POST"],
-  ["/v1/models", "GET"]
+const routes = new Map([
+  ["/v1/messages",              { method: "POST", dialect: "anthropic", betaQuery: true,  flow: completeMessage }],
+  ["/v1/messages/count_tokens", { method: "POST", dialect: "anthropic", betaQuery: false, flow: forwardChatRequest }],
+  ["/v1/chat/completions",      { method: "POST", dialect: "openai",    betaQuery: false, flow: forwardChatRequest }],
+  ["/v1/responses",             { method: "POST", dialect: "openai",    betaQuery: false, flow: forwardChatRequest }],
+  ["/v1/models",                { method: "GET",  dialect: "openai",    betaQuery: false, flow: forwardModelCatalogue }]
 ]);
-const servedRoutesMessage = `Supported endpoints: ${[...servedRoutes].map(([path, method]) => `${method} ${path}`).join(", ")}.`;
-
-// Path picks the dialect. /v1/messages and everything under it speak Anthropic.
-// Every other served path speaks OpenAI, including /v1/responses as itself.
-function dialectFor(pathname) {
-  const anthropic = pathname === "/v1/messages" || String(pathname).startsWith("/v1/messages/");
-  return Object.freeze({
-    name: anthropic ? "anthropic" : "openai",
-    addBetaQuery: pathname === "/v1/messages"
-  });
-}
+const servedRoutesMessage = `Supported endpoints: ${[...routes].map(([path, route]) => `${route.method} ${path}`).join(", ")}.`;
 
 function clientErrorShape(requestUrl, type, message, code = undefined) {
-  if (dialectFor(requestUrl?.pathname).name === "openai") {
+  const dialect = routes.get(requestUrl?.pathname)?.dialect || "anthropic";
+  if (dialect === "openai") {
     return { error: { message, type, ...(code ? { code } : {}) } };
   }
   return { type: "error", error: { type, message } };
@@ -525,13 +615,13 @@ function readBody(req) {
   });
 }
 
-function buildUpstreamPath(requestUrl) {
+function buildUpstreamPath(requestUrl, upstream, dialect, betaQuery) {
   let pathname = requestUrl.pathname;
-  if (upstreamBaseUrl.pathname !== "/") {
-    pathname = `${upstreamBaseUrl.pathname.replace(/\/$/, "")}${pathname}`;
+  if (upstream.baseUrl.pathname !== "/") {
+    pathname = `${upstream.baseUrl.pathname.replace(/\/$/, "")}${pathname}`;
   }
-  const target = new URL(`${pathname}${requestUrl.search}`, upstreamBaseUrl);
-  if (dialectFor(requestUrl.pathname).addBetaQuery && !target.searchParams.has("beta")) {
+  const target = new URL(`${pathname}${requestUrl.search}`, upstream.baseUrl);
+  if (dialect === "anthropic" && betaQuery && !target.searchParams.has("beta")) {
     target.searchParams.set("beta", "true");
   }
   return `${target.pathname}${target.search}`;
@@ -574,10 +664,10 @@ const bareClientDefaults = {
   "content-type": "application/json"
 };
 
-function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
+function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, upstream, dialect) {
   const headers = {};
   const omit = new Set(requestHeadersProxyOwns);
-  if (dialect.name === "openai") {
+  if (dialect === "openai") {
     omit.add("anthropic-version");
     omit.add("anthropic-beta");
   }
@@ -594,8 +684,8 @@ function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
   }
 
   headers["x-claude-code-session-id"] = sessionId(sourceHeaders);
-  headers.authorization = `Bearer ${apiKey}`;
-  if (dialect.name === "anthropic") {
+  headers.authorization = `Bearer ${upstream.apiKey}`;
+  if (dialect === "anthropic") {
     if (headers["anthropic-version"] === undefined) headers["anthropic-version"] = "2023-06-01";
     headers["anthropic-beta"] = mergeBetaHeader(sourceHeaders["anthropic-beta"]);
   }
@@ -605,31 +695,31 @@ function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
   return headers;
 }
 
-function requestUpstream(req, requestUrl, body, wantsStream, onResponse) {
-  const transport = upstreamBaseUrl.protocol === "http:" ? http : https;
+function requestUpstream(req, requestUrl, body, wantsStream, route, upstream, onResponse) {
+  const transport = upstream.baseUrl.protocol === "http:" ? http : https;
   const requestId = req._proxyRequestId || "--------";
-  const upstreamPath = buildUpstreamPath(requestUrl);
-  const upstreamHeaders = safeUpstreamHeaders(req.headers, body.length, wantsStream, dialectFor(requestUrl.pathname));
+  const upstreamPath = buildUpstreamPath(requestUrl, upstream, route.dialect, route.betaQuery);
+  const upstreamHeaders = safeUpstreamHeaders(req.headers, body.length, wantsStream, upstream, route.dialect);
   const startedRequestAt = Date.now();
 
-  log(requestId, "->UP", `${req.method} ${upstreamBaseUrl.origin}${upstreamPath} (${body.length} bytes, stream=${wantsStream})`);
+  log(requestId, "->UP", `${upstream.name} ${req.method} ${upstream.baseUrl.origin}${upstreamPath} (${body.length} bytes, stream=${wantsStream})`);
   if (logVerbose) {
     log(requestId, "->UP", `headers ${JSON.stringify(upstreamHeaders)}`);
     log(requestId, "->UP", `body ${truncate(body.toString("utf8"))}`);
   }
-  trace(requestId, "UPSTREAM-REQ", `${req.method} ${upstreamBaseUrl.origin}${upstreamPath} stream=${wantsStream}`);
+  trace(requestId, "UPSTREAM-REQ", `${upstream.name} ${req.method} ${upstream.baseUrl.origin}${upstreamPath} stream=${wantsStream}`);
   trace(requestId, "UPSTREAM-REQ-HEADERS", upstreamHeaders);
   trace(requestId, "UPSTREAM-REQ-BODY", body.toString("utf8"));
 
-  const upstream = transport.request(
+  const upstreamReq = transport.request(
     {
-      protocol: upstreamBaseUrl.protocol,
-      hostname: upstreamBaseUrl.hostname,
-      port: upstreamBaseUrl.port || undefined,
+      protocol: upstream.baseUrl.protocol,
+      hostname: upstream.baseUrl.hostname,
+      port: upstream.baseUrl.port || undefined,
       path: upstreamPath,
       method: req.method,
       headers: upstreamHeaders,
-      agent: upstreamBaseUrl.protocol === "http:" ? httpAgent : httpsAgent,
+      agent: upstream.baseUrl.protocol === "http:" ? httpAgent : httpsAgent,
       timeout: upstreamTimeoutMs
     },
     (upstreamRes) => {
@@ -656,17 +746,13 @@ function requestUpstream(req, requestUrl, body, wantsStream, onResponse) {
     }
   );
 
-  upstream.on("timeout", () => upstream.destroy(new Error("Upstream request timed out.")));
-  upstream.on("error", (error) => {
+  upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("Upstream request timed out.")));
+  upstreamReq.on("error", (error) => {
     log(requestId, "<-UP", `network error: ${error.message}`);
     trace(requestId, "UPSTREAM-NETERR", error.message);
   });
-  req.once("aborted", () => {
-    trace(requestId, "CLIENT-ABORTED", "client closed the connection");
-    upstream.destroy(new Error("Client aborted request."));
-  });
-  upstream.end(body);
-  return upstream;
+  upstreamReq.end(body);
+  return upstreamReq;
 }
 
 function stripHopByHopHeaders(source) {
@@ -840,14 +926,19 @@ function sendRetryableProxyError(res, requestUrl, status, message, extraHeaders 
 }
 
 function sendNetworkError(res, requestUrl, error) {
-  stats.networkErrors += 1;
+  if (!isClientAbort(error)) stats.networkErrors += 1;
   const message = error instanceof Error ? error.message : String(error);
   sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
 }
 
-function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
+function classifyUpstreamResponse(upstreamRes, bodyText) {
   const status = upstreamRes.statusCode || 502;
-  const classification = errorClassification(status, bodyText);
+  return status < 400 ? null : errorClassification(status, bodyText);
+}
+
+function deliverUpstreamError(res, requestUrl, upstreamRes, bodyText, classification = classifyUpstreamResponse(upstreamRes, bodyText)) {
+  if (res.headersSent) return;
+  const status = upstreamRes.statusCode || 502;
   stats.upstreamErrors += 1;
   log("upstream ", "<-UP", `error ${status} [${classification.kind}/${classification.reason}] ${truncate(bodyText)}`);
 
@@ -896,18 +987,6 @@ function sendUpstreamError(res, requestUrl, upstreamRes, bodyText) {
   headers["content-length"] = Buffer.byteLength(body);
   res.writeHead(status, headers);
   res.end(body);
-}
-
-// The single gate every chat-route upstream response passes through, so each
-// caller below only ever deals with a response the gateway considers
-// successful. The /v1/models pass-through opts out: the gateway owns the
-// catalogue's errors too.
-function handledUpstreamFailure(res, requestUrl, upstreamRes) {
-  if ((upstreamRes.statusCode || 502) < 400) return false;
-  collectResponseBody(upstreamRes)
-    .then((bodyText) => sendUpstreamError(res, requestUrl, upstreamRes, bodyText))
-    .catch((error) => sendNetworkError(res, requestUrl, error));
-  return true;
 }
 
 function applyAnthropicSsePayload(state, payload) {
@@ -978,7 +1057,7 @@ function buildCollectedAnthropicMessage(state, requestedModel) {
     id: message.id || `msg_proxy_${crypto.randomUUID().replaceAll("-", "")}`,
     type: "message",
     role: message.role || "assistant",
-    model: message.model || requestedModel || defaultModel,
+    model: message.model || requestedModel,
     content: state.blocks.filter(Boolean),
     stop_reason: state.stopReason || message.stop_reason || "end_turn",
     stop_sequence: state.stopSequence ?? message.stop_sequence ?? null,
@@ -1004,8 +1083,9 @@ function isTerminalSseFrame(frame) {
   }
 }
 
-function filteredStreamingResponse(upstreamRes, res, requestUrl) {
+function filteredStreamingResponse(upstreamRes, res, requestUrl, upstream, canFailover, finish) {
   const responseHeaders = stripHopByHopHeaders(upstreamRes.headers);
+  responseHeaders["x-proxy-upstream"] = upstream.name;
   let buffer = "";
   let started = false;
   let sawMeaningfulFrame = false;
@@ -1018,6 +1098,7 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
     if (started) return;
     started = true;
     res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
+    finish({ kind: "committed", healthy: true });
   }
 
   function handleFrame(frame) {
@@ -1026,9 +1107,15 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
       const earlyError = sseErrorInfo(frame);
       if (earlyError) {
         finished = true;
+        if (earlyError.status === 503 && canFailover) {
+          finish({ kind: "failover", reason: "sse-error-before-first-token" });
+          return;
+        }
+        res.setHeader("x-proxy-upstream", upstream.name);
         sendRetryableProxyError(res, requestUrl, earlyError.status, earlyError.message, {
           "x-proxy-classification": "sse-error-before-first-token"
         });
+        finish({ kind: "delivered", healthy: false, cool: earlyError.status === 503 });
         upstreamRes.destroy();
         return;
       }
@@ -1067,9 +1154,15 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
     if (finished) return;
     if (!sawMeaningfulFrame) {
       stats.emptyStreamsRecovered += 1;
+      if (canFailover) {
+        finish({ kind: "failover", reason: "empty-stream" });
+        return;
+      }
+      res.setHeader("x-proxy-upstream", upstream.name);
       sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream. Retrying is safe.", {
         "x-proxy-classification": "empty-stream"
       });
+      finish({ kind: "delivered", healthy: false, cool: true });
       return;
     }
     if (!started) startResponse();
@@ -1078,17 +1171,23 @@ function filteredStreamingResponse(upstreamRes, res, requestUrl) {
 
   upstreamRes.on("error", (error) => {
     if (finished) return;
-    stats.networkErrors += 1;
+    if (!isClientAbort(error)) stats.networkErrors += 1;
     if (!started) {
+      if (canFailover && !isClientAbort(error)) {
+        finish({ kind: "failover", reason: "response-stream-error" });
+        return;
+      }
+      res.setHeader("x-proxy-upstream", upstream.name);
       sendRetryableProxyError(res, requestUrl, 503, `Upstream stream failed before first event: ${error.message}`);
+      finish({ kind: "delivered", healthy: false, cool: !isClientAbort(error) });
     } else {
       res.destroy(error);
     }
   });
 }
 
-function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) {
-  const upstreamBody = Buffer.from(JSON.stringify({ ...clientPayload, stream: true }));
+function completeMessage(upstreamRes, res, requestUrl, body, upstream, canFailover, finish) {
+  const clientPayload = JSON.parse(body.toString("utf8"));
   const state = {
     message: null,
     blocks: [],
@@ -1101,76 +1200,200 @@ function collectAnthropicStreamingResponse(req, res, requestUrl, clientPayload) 
   let buffer = "";
   let finalized = false;
 
-  const upstream = requestUpstream(req, requestUrl, upstreamBody, true, (upstreamRes) => {
-    if (handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
-
-    // Reply as soon as the message is complete. Waiting for the upstream socket
-    // to close adds the gateway's full keep-alive idle timeout to every call.
-    function finalize() {
-      if (finalized) return;
-      finalized = true;
-      if (state.error) {
-        const status = sseErrorStatus(state.error);
-        const message = state.error.message;
-        if (status) {
-          sendRetryableProxyError(res, requestUrl, status, message || transientSseErrorMessage);
-        } else {
-          sendJson(res, 502, clientErrorShape(requestUrl, "api_error", message || "Upstream stream returned an error."));
-        }
-        return;
+  // Reply as soon as the message is complete. Waiting for the upstream socket
+  // to close adds the gateway's full keep-alive idle timeout to every call.
+  function finalize() {
+    if (finalized) return;
+    finalized = true;
+    if (state.error) {
+      const status = sseErrorStatus(state.error);
+      const message = state.error.message;
+      if (status === 503 && canFailover) {
+        finish({ kind: "failover", reason: "sse-error-before-first-token" });
+      } else if (status) {
+        res.setHeader("x-proxy-upstream", upstream.name);
+        sendRetryableProxyError(res, requestUrl, status, message || transientSseErrorMessage);
+        finish({ kind: "delivered", healthy: false, cool: status === 503 });
+      } else {
+        res.setHeader("x-proxy-upstream", upstream.name);
+        sendJson(res, 502, clientErrorShape(requestUrl, "api_error", message || "Upstream stream returned an error."));
+        finish({ kind: "delivered", healthy: false, cool: true });
       }
-      if (!state.seenUsefulEvent) {
-        stats.emptyStreamsRecovered += 1;
-        sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream while collecting a non-streaming response.");
-        return;
-      }
-      sendJson(res, 200, buildCollectedAnthropicMessage(state, clientPayload.model));
+      return;
     }
+    if (!state.seenUsefulEvent) {
+      stats.emptyStreamsRecovered += 1;
+      if (canFailover) {
+        finish({ kind: "failover", reason: "empty-stream" });
+        return;
+      }
+      res.setHeader("x-proxy-upstream", upstream.name);
+      sendRetryableProxyError(res, requestUrl, 503, "Upstream returned an empty SSE stream while collecting a non-streaming response.");
+      finish({ kind: "delivered", healthy: false, cool: true });
+      return;
+    }
+    res.setHeader("x-proxy-upstream", upstream.name);
+    sendJson(res, 200, buildCollectedAnthropicMessage(state, clientPayload.model));
+    finish({ kind: "delivered", healthy: true });
+  }
 
-    upstreamRes.setEncoding("utf8");
-    upstreamRes.on("data", (chunk) => {
-      if (finalized) return;
-      buffer = parseSseEvents(buffer + chunk, (payload) => {
-        applyAnthropicSsePayload(state, payload);
-        if (payload.type === "message_stop") {
-          stats.streamsClosedOnTerminalFrame += 1;
-          finalize();
-          upstreamRes.destroy();
-        }
-      });
-    });
-    upstreamRes.on("end", () => {
-      if (finalized) return;
-      if (buffer.trim()) parseSseEvents(`${buffer}\n\n`, (payload) => applyAnthropicSsePayload(state, payload));
-      finalize();
-    });
-    upstreamRes.on("error", (error) => {
-      if (finalized) return;
-      sendNetworkError(res, requestUrl, error);
+  upstreamRes.setEncoding("utf8");
+  upstreamRes.on("data", (chunk) => {
+    if (finalized) return;
+    buffer = parseSseEvents(buffer + chunk, (payload) => {
+      applyAnthropicSsePayload(state, payload);
+      if (payload.type === "message_stop") {
+        stats.streamsClosedOnTerminalFrame += 1;
+        finalize();
+        upstreamRes.destroy();
+      }
     });
   });
-  upstream.on("error", (error) => {
+  upstreamRes.on("end", () => {
     if (finalized) return;
-    sendNetworkError(res, requestUrl, error);
+    if (buffer.trim()) parseSseEvents(`${buffer}\n\n`, (payload) => applyAnthropicSsePayload(state, payload));
+    finalize();
+  });
+  upstreamRes.on("error", (error) => {
+    if (finalized) return;
+    if (canFailover) {
+      if (!isClientAbort(error)) stats.networkErrors += 1;
+      finalized = true;
+      finish({ kind: "failover", reason: "response-stream-error" });
+    } else {
+      res.setHeader("x-proxy-upstream", upstream.name);
+      sendNetworkError(res, requestUrl, error);
+      finish({ kind: "delivered", healthy: false, cool: !isClientAbort(error) });
+    }
   });
 }
 
-function pipeRequest(req, res, requestUrl, body, wantsStream, transparent = false) {
-  const upstream = requestUpstream(req, requestUrl, body, wantsStream, (upstreamRes) => {
-    // A transparent route forwards whatever the gateway answered, errors
-    // included: no classification, no rewrite, no SSE sanitation.
-    if (!transparent && handledUpstreamFailure(res, requestUrl, upstreamRes)) return;
+function forwardChatRequest(upstreamRes, res, requestUrl, _body, upstream, canFailover, finish, wantsStream) {
+  if (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream")) {
+    filteredStreamingResponse(upstreamRes, res, requestUrl, upstream, canFailover, finish);
+    return;
+  }
+  const headers = stripHopByHopHeaders(upstreamRes.headers);
+  headers["x-proxy-upstream"] = upstream.name;
+  res.writeHead(upstreamRes.statusCode, headers);
+  finish({ kind: "committed", healthy: true });
+  upstreamRes.pipe(res);
+  upstreamRes.on("error", (error) => res.destroy(error));
+}
 
-    if (!transparent && (wantsStream || String(upstreamRes.headers["content-type"] || "").includes("text/event-stream"))) {
-      filteredStreamingResponse(upstreamRes, res, requestUrl);
-      return;
-    }
-
-    res.writeHead(upstreamRes.statusCode, stripHopByHopHeaders(upstreamRes.headers));
-    upstreamRes.pipe(res);
-    upstreamRes.on("error", (error) => res.destroy(error));
+// The catalogue belongs to the gateway, including its errors. Forward the
+// response byte for byte without classification, rewriting or SSE sanitation.
+function forwardModelCatalogue(upstreamRes, res, _requestUrl, _body, upstream, _canFailover, finish) {
+  const headers = stripHopByHopHeaders(upstreamRes.headers);
+  headers["x-proxy-upstream"] = upstream.name;
+  res.writeHead(upstreamRes.statusCode, headers);
+  finish({
+    kind: "committed",
+    healthy: (upstreamRes.statusCode || 502) < 400,
+    cool: (upstreamRes.statusCode || 502) >= 500
   });
-  upstream.on("error", (error) => sendNetworkError(res, requestUrl, error));
+  upstreamRes.pipe(res);
+  upstreamRes.on("error", (error) => res.destroy(error));
+}
+
+function upstreamOrder() {
+  const now = Date.now();
+  const live = upstreams.filter((upstream) => upstream.coolUntil <= now);
+  // ponytail: all waiters retry the primary on expiry; single-flight probe if it matters.
+  return live.length ? live : upstreams;
+}
+
+function attemptUpstream(req, res, requestUrl, body, wantsStream, route, upstream, canFailover) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let outcomeKind = null;
+    let upstreamReq = null;
+    let upstreamRes = null;
+
+    const clientClosed = () => {
+      if (outcomeKind === "delivered") return;
+      const abortError = new Error("Client aborted request.");
+      abortError.code = "PROXY_CLIENT_ABORT";
+      upstreamReq?.destroy(abortError);
+      upstreamRes?.destroy(abortError);
+      if (!settled) finish({ kind: "delivered", healthy: false });
+    };
+    req.once("aborted", clientClosed);
+    res.once("close", clientClosed);
+
+    const finish = (outcome) => {
+      if (settled) return;
+      settled = true;
+      outcomeKind = outcome.kind;
+      req.off("aborted", clientClosed);
+      if (outcome.kind !== "committed") res.off("close", clientClosed);
+      if (outcome.kind === "failover") {
+        upstreamReq?.destroy();
+        if (upstreamRes && !upstreamRes.complete) upstreamRes.destroy();
+      }
+      resolve(outcome);
+    };
+
+    const networkFailure = (error, reason) => {
+      if (settled) return;
+      if (!isClientAbort(error)) stats.networkErrors += 1;
+      if (canFailover && !isClientAbort(error)) {
+        finish({ kind: "failover", reason });
+        return;
+      }
+      res.setHeader("x-proxy-upstream", upstream.name);
+      const message = error instanceof Error ? error.message : String(error);
+      sendRetryableProxyError(res, requestUrl, 503, `Upstream connection error: ${message}`);
+      finish({ kind: "delivered", healthy: false, cool: !isClientAbort(error) });
+    };
+
+    upstream.requests += 1;
+    upstreamReq = requestUpstream(req, requestUrl, body, wantsStream, route, upstream, async (response) => {
+      if (settled) {
+        response.destroy();
+        return;
+      }
+      upstreamRes = response;
+      const status = response.statusCode || 502;
+      if (status >= 500 && canFailover) {
+        finish({ kind: "failover", reason: `http-${status}` });
+        return;
+      }
+      if (status >= 400 && route.flow !== forwardModelCatalogue) {
+        try {
+          const bodyText = await collectResponseBody(response);
+          if (settled) return;
+          const classification = classifyUpstreamResponse(response, bodyText);
+          res.setHeader("x-proxy-upstream", upstream.name);
+          deliverUpstreamError(res, requestUrl, response, bodyText, classification);
+          finish({ kind: "delivered", healthy: false, cool: status >= 500 });
+        } catch (error) {
+          networkFailure(error, "response-stream-error");
+        }
+        return;
+      }
+      route.flow(response, res, requestUrl, body, upstream, canFailover, finish, wantsStream);
+    });
+    upstreamReq.on("error", (error) => networkFailure(error, "network-error"));
+  });
+}
+
+async function proxyRequest(req, res, requestUrl, body, wantsStream, route) {
+  const order = upstreamOrder();
+  const deadline = Date.now() + upstreamTimeoutMs + 30000;
+  for (let index = 0; index < order.length; index += 1) {
+    const upstream = order[index];
+    const canFailover = index < order.length - 1 && Date.now() < deadline;
+    const outcome = await attemptUpstream(req, res, requestUrl, body, wantsStream, route, upstream, canFailover);
+    if (outcome.kind === "failover" || outcome.cool) {
+      upstream.coolUntil = Date.now() + cooldownMs;
+      upstream.failovers += 1;
+      stats.failovers += 1;
+    }
+    if (outcome.kind === "failover") continue;
+    if (outcome.healthy) upstream.coolUntil = 0;
+    return;
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1235,7 +1458,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (servedRoutes.get(requestUrl.pathname) !== req.method) {
+    const route = routes.get(requestUrl.pathname);
+    if (route?.method !== req.method) {
       sendJson(res, 404, clientErrorShape(requestUrl, "not_found", servedRoutesMessage));
       return;
     }
@@ -1249,9 +1473,9 @@ const server = http.createServer(async (req, res) => {
     // is no body on either leg to read, parse or normalise, which is why this
     // returns before the JSON path below rather than being another branch
     // inside it.
-    if (requestUrl.pathname === "/v1/models") {
+    if (route.flow === forwardModelCatalogue) {
       trace(requestId, "ROUTE", requestUrl.pathname);
-      pipeRequest(req, res, requestUrl, Buffer.alloc(0), false, true);
+      await proxyRequest(req, res, requestUrl, Buffer.alloc(0), false, route);
       return;
     }
 
@@ -1266,10 +1490,12 @@ const server = http.createServer(async (req, res) => {
     const wantsStream = payload.stream === true;
     trace(requestId, "ROUTE", `${requestUrl.pathname} model=${payload.model || "?"} stream=${wantsStream}`);
 
-    if (requestUrl.pathname === "/v1/messages" && !wantsStream) {
-      collectAnthropicStreamingResponse(req, res, requestUrl, payload);
+    if (route.flow === completeMessage && !wantsStream) {
+      const upstreamBody = Buffer.from(JSON.stringify({ ...payload, stream: true }));
+      await proxyRequest(req, res, requestUrl, upstreamBody, true, route);
     } else {
-      pipeRequest(req, res, requestUrl, body, wantsStream);
+      const flow = route.flow === completeMessage ? forwardChatRequest : route.flow;
+      await proxyRequest(req, res, requestUrl, body, wantsStream, { ...route, flow });
     }
   } catch (error) {
     sendHttpError(res, requestUrl, error);
@@ -1309,7 +1535,14 @@ const healthServer = http.createServer((req, res) => {
     version: proxyVersion,
     node: nodeRuntimeVersion,
     uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
-    upstream: upstreamBaseUrl.origin,
+    upstreams: upstreams.map((upstream) => ({
+      name: upstream.name,
+      origin: upstream.baseUrl.origin,
+      cooling: upstream.coolUntil > Date.now(),
+      cool_until: upstream.coolUntil || null,
+      requests: upstream.requests,
+      failovers: upstream.failovers
+    })),
     stats: { ...stats }
   });
 });

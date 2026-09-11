@@ -14,14 +14,26 @@ import { join } from "node:path";
 // "test-" would collide with the "test-lingering" model id. LOCAL_PROXY_KEY also
 // has to clear the proxy's 32-character floor or the proxy refuses to start.
 const testApiKey = "Zq7upstreamKeyNeverLeavesTheMock9Xv";
+const secondaryApiKey = "Vb8secondaryKeyStaysPrivate4Qn";
+const thirdApiKey = "Mc6thirdKeyStaysPrivate2Lp";
 const localKey = "Kd4localProxySharedSecretForTests7Wm";
 const captured = [];
+const secondaryCaptured = [];
+const thirdCaptured = [];
 const lingeringResponses = [];
+const validationOutputs = [];
+const lifecycleEvents = [];
+let resolveClientAbortStarted;
+let resolveClientAbortClosed;
+let resolveFailedResponseDestroyed;
+const clientAbortStarted = new Promise((resolve) => { resolveClientAbortStarted = resolve; });
+const clientAbortClosed = new Promise((resolve) => { resolveClientAbortClosed = resolve; });
+const failedResponseDestroyed = new Promise((resolve) => { resolveFailedResponseDestroyed = resolve; });
 const preservedSession = "123e4567-e89b-42d3-a456-426614174000";
 
 // The gateway's model catalogue. Both ids are unlike anything else the suite
-// sends, and neither is UPSTREAM_MODEL, so an assertion that the proxy returned
-// this list cannot pass on a list the proxy invented from its own config.
+// sends, so an assertion that the proxy returned this list cannot pass on a
+// catalogue the proxy invented from its own configuration.
 const upstreamModelCatalogue = {
   data: [
     { type: "model", id: "gateway-alpha", display_name: "Gateway Alpha", created_at: "2026-01-09T00:00:00Z" },
@@ -127,6 +139,64 @@ const upstream = http.createServer((req, res) => {
 
     if (req.url.startsWith("/v1/messages")) {
       switch (payload.model) {
+        case "test-failover-500":
+        case "test-failover-empty-complete":
+          if (payload.model === "test-failover-500") {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "api_error", message: "primary unavailable" } }));
+          } else {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end('event: ping\ndata: null\n\n');
+          }
+          return;
+        case "test-no-failover-429":
+          res.writeHead(429, { "content-type": "application/json", "retry-after": "5" });
+          res.end(JSON.stringify({ error: { type: "rate_limit_error", message: "primary rate limit" } }));
+          return;
+        case "test-no-failover-400":
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "primary rejected request" } }));
+          return;
+        case "test-destroy-prior":
+          res.on("close", () => {
+            lifecycleEvents.push("primary-response-destroyed");
+            resolveFailedResponseDestroyed();
+          });
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.write("partial primary failure");
+          return;
+        case "test-client-abort":
+          res.on("close", resolveClientAbortClosed);
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.flushHeaders();
+          resolveClientAbortStarted();
+          return;
+        case "test-failover-sse-503":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"primary overloaded"}}\n\n');
+          return;
+        case "test-no-failover-sse-429":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"primary rate limited"}}\n\n');
+          return;
+        case "test-failover-empty-stream":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: ping\ndata: null\n\n');
+          return;
+        case "test-failover-before-first":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.flushHeaders();
+          res.socket.destroy();
+          return;
+        case "test-failover-after-first":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_partial","type":"message","role":"assistant","model":"claude-opus-4-8","content":[]}}\n\n');
+          setTimeout(() => res.socket.destroy(), 20);
+          return;
+        case "test-all-down":
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.end("primary down");
+          return;
         case "test-rate":
           res.writeHead(403, { "content-type": "application/json", "retry-after": "7" });
           res.end(JSON.stringify({ error: { type: "gateway_error", message: "quota exceeded for this key" } }));
@@ -172,6 +242,31 @@ const upstream = http.createServer((req, res) => {
 
     if (req.url.startsWith("/v1/responses")) {
       switch (payload.model) {
+        case "test-failover-responses":
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "primary unavailable", type: "api_error" } }));
+          return;
+        case "test-all-down":
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.end("primary down");
+          return;
+        case "test-failover-empty-stream":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: ping\ndata: null\n\n');
+          return;
+        case "test-failover-sse-503":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"primary overloaded"}}\n\n');
+          return;
+        case "test-no-failover-sse-429":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"primary rate limited"}}\n\n');
+          return;
+        case "test-failover-after-first":
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hi"}\n\n');
+          setTimeout(() => res.socket.destroy(), 20);
+          return;
         case "test-rate-responses":
           res.writeHead(403, { "content-type": "application/json", "retry-after": "7" });
           res.end(JSON.stringify({ error: { type: "gateway_error", message: "quota exceeded for this key" } }));
@@ -226,6 +321,37 @@ const upstream = http.createServer((req, res) => {
     }
 
     if (req.url.startsWith("/v1/chat/completions")) {
+      if (payload.model === "test-failover-chat") {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "primary unavailable", type: "api_error" } }));
+        return;
+      }
+      if (payload.model === "test-all-down") {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("primary down");
+        return;
+      }
+      if (payload.model === "test-failover-empty-stream") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end('event: ping\ndata: null\n\n');
+        return;
+      }
+      if (payload.model === "test-failover-sse-503") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"primary overloaded"}}\n\n');
+        return;
+      }
+      if (payload.model === "test-no-failover-sse-429") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end('event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"primary rate limited"}}\n\n');
+        return;
+      }
+      if (payload.model === "test-failover-after-first") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"id":"chat_partial","object":"chat.completion.chunk","model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}\n\n');
+        setTimeout(() => res.socket.destroy(), 20);
+        return;
+      }
       if (payload.model === "test-rate-openai") {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "用户额度不足", type: "gateway_error" } }));
@@ -236,6 +362,11 @@ const upstream = http.createServer((req, res) => {
     }
 
     if (req.url.startsWith("/v1/models")) {
+      if (req.url.includes("failall=1") || req.url.includes("failprimary=1")) {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("primary down");
+        return;
+      }
       if (req.url.includes("force429")) {
         res.writeHead(429, { "content-type": "application/json", "retry-after": "7" });
         res.end(JSON.stringify({ error: { type: "rate_limit_error", message: "quota" } }));
@@ -260,12 +391,72 @@ const upstream = http.createServer((req, res) => {
   });
 });
 
+function createBackupUpstream(name, requests) {
+  return http.createServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      let payload = {};
+      try { payload = body ? JSON.parse(body) : {}; } catch {}
+      requests.push({ method: req.method, url: req.url, headers: req.headers, body, payload });
+      if (payload.model === "test-destroy-prior") lifecycleEvents.push(`${name}-request-started`);
+
+      const preserveFailure = new Set([
+        "test-500-html", "test-empty", "test-sse-error", "test-sse-error-typed",
+        "test-500-html-responses", "test-empty-responses", "test-all-down"
+      ]);
+      if (preserveFailure.has(payload.model) || req.url.includes("force500html") || req.url.includes("failall=1")) {
+        if (payload.model?.includes("empty")) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: ping\ndata: null\n\n');
+        } else if (payload.model?.includes("sse-error")) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          const message = payload.model === "test-sse-error-typed" ? "pick a different model" : "provider overloaded";
+          res.end(`event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"${message}"}}\n\n`);
+        } else {
+          res.writeHead(500, { "content-type": "text/html" });
+          res.end("<html>gateway exploded</html>");
+        }
+        return;
+      }
+      if (req.url.includes("forceempty")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("");
+        return;
+      }
+
+      if (req.url.startsWith("/v1/messages/count_tokens")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ input_tokens: 123 }));
+      } else if (req.url.startsWith("/v1/messages")) {
+        writeAnthropicTextStream(res, name.toUpperCase());
+      } else if (req.url.startsWith("/v1/responses")) {
+        if (payload.stream === true) writeResponsesTextStream(res, name.toUpperCase());
+        else writeResponsesJson(res, payload);
+      } else if (req.url.startsWith("/v1/chat/completions")) {
+        writeOpenAiStream(res);
+      } else if (req.url.startsWith("/v1/models")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ...upstreamModelCatalogue, served_by: name }));
+      } else {
+        res.writeHead(404).end();
+      }
+    });
+  });
+}
+
+const secondary = createBackupUpstream("secondary", secondaryCaptured);
+const third = createBackupUpstream("third", thirdCaptured);
+
 // Two free ports are needed now: the public one and the health listener's. Both
 // probes are held open at the same time before either is released, because
 // closing the first one before asking for the second lets the kernel hand back
 // the same number twice -- and two identical ports is the one combination the
 // proxy refuses to start on.
 const upstreamPort = await listen(upstream);
+const secondaryPort = await listen(secondary);
+const thirdPort = await listen(third);
 const probe = http.createServer();
 const healthProbe = http.createServer();
 const proxyPort = await listen(probe);
@@ -282,6 +473,13 @@ await Promise.all([once(probe, "close"), once(healthProbe, "close")]);
 // hermetic, otherwise a developer shell that happens to export these would hide
 // a missing variable here and the suite would fail only in CI or in a container.
 const traceFilePath = join(tmpdir(), `proxy-test-trace-${process.pid}.log`);
+const upstreamsFilePath = join(tmpdir(), `proxy-test-upstreams-${process.pid}.json`);
+const validationPaths = [];
+fs.writeFileSync(upstreamsFilePath, JSON.stringify([
+  { name: "primary", base_url: `http://127.0.0.1:${upstreamPort}`, api_key: testApiKey },
+  { name: "secondary", base_url: `http://127.0.0.1:${secondaryPort}`, api_key: secondaryApiKey },
+  { name: "third", base_url: `http://127.0.0.1:${thirdPort}`, api_key: thirdApiKey }
+]));
 const proxyEnv = {
   HOST: "127.0.0.1",
   PORT: String(proxyPort),
@@ -289,12 +487,11 @@ const proxyEnv = {
   // Both names the suite reaches this proxy under. Everything else, including
   // the DNS-rebinding names a browser could point at 127.0.0.1, is refused.
   ALLOWED_HOSTS: "127.0.0.1,localhost",
-  UPSTREAM_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
-  UPSTREAM_API_KEY: testApiKey,
+  UPSTREAMS_FILE: upstreamsFilePath,
   LOCAL_PROXY_KEY: localKey,
   CLAUDE_CODE_VERSION: "0.0.0-test",
-  UPSTREAM_MODEL: "claude-opus-4-8",
   UPSTREAM_TIMEOUT_MS: "300000",
+  UPSTREAM_COOLDOWN_MS: "100",
   RETRY_AFTER_SECONDS: "11",
   MAX_BODY_BYTES: "26214400",
   PROXY_LOG: "true",
@@ -312,6 +509,9 @@ const proxy = spawn(process.execPath, ["proxy.mjs"], {
 });
 
 let stderr = "";
+let stdout = "";
+proxy.stdout.setEncoding("utf8");
+proxy.stdout.on("data", (chunk) => { stdout += chunk; });
 proxy.stderr.setEncoding("utf8");
 proxy.stderr.on("data", (chunk) => { stderr += chunk; });
 
@@ -405,11 +605,15 @@ function runProxyToExit(env) {
     const guard = setTimeout(() => child.kill("SIGKILL"), 10000);
     child.once("error", (error) => {
       clearTimeout(guard);
-      resolve({ code: null, stdout, stderr: String(error) });
+      const result = { code: null, stdout, stderr: String(error) };
+      validationOutputs.push(result);
+      resolve(result);
     });
     child.once("close", (code) => {
       clearTimeout(guard);
-      resolve({ code, stdout, stderr: childStderr });
+      const result = { code, stdout, stderr: childStderr };
+      validationOutputs.push(result);
+      resolve(result);
     });
   });
 }
@@ -423,6 +627,13 @@ function envWithout(...names) {
 // The sibling for values that are present but unusable, rather than absent.
 function envWith(overrides) {
   return { ...proxyEnv, ...overrides };
+}
+
+function envWithUpstreams(contents) {
+  const filePath = join(tmpdir(), `proxy-test-invalid-upstreams-${process.pid}-${validationPaths.length}.json`);
+  fs.writeFileSync(filePath, typeof contents === "string" ? contents : JSON.stringify(contents));
+  validationPaths.push(filePath);
+  return envWith({ UPSTREAMS_FILE: filePath });
 }
 
 try {
@@ -518,6 +729,11 @@ try {
   });
   assert.equal(modelsEmpty.status, 200);
   assert.equal(await modelsEmpty.text(), "");
+
+  // The preceding all-upstreams-500 case cools every gateway. Let that state
+  // expire before the legacy route assertions that intentionally inspect the
+  // primary's captured wire image.
+  await new Promise((resolve) => setTimeout(resolve, 120));
 
   // Each path answers to exactly one method, so /v1/models by POST is refused
   // the same way a path that is not served at all is -- one status, one body,
@@ -767,6 +983,7 @@ try {
   assert.equal(responsesEmpty.headers.get("x-proxy-classification"), "empty-stream");
   assert.equal(responsesEmptyJson.error.type, "api_error");
   assert.equal(responsesEmptyJson.type, undefined);
+  await new Promise((resolve) => setTimeout(resolve, 120));
 
   for (const [model, terminal] of [
     ["test-lingering-incomplete", "response.incomplete"],
@@ -904,6 +1121,7 @@ try {
     assert.equal(typedSseError.status, 503, `overloaded_error must be retryable with stream=${stream}`);
     assert.equal(typedSseErrorJson.error.message, "pick a different model");
   }
+  await new Promise((resolve) => setTimeout(resolve, 120));
 
   // Anthropic token-count passthrough.
   const tokenCount = await post("/v1/messages/count_tokens", {
@@ -1066,6 +1284,269 @@ try {
   assert.equal(fs.statSync(traceFilePath).size, traceSizeBeforeProbes, "host-rejected requests left trace file entries");
 
   // -------------------------------------------------------------------------
+  // Priority-ordered failover. Each failure case starts after the short test
+  // cooldown so the primary is eligible; cooldown behavior itself is asserted
+  // separately below.
+  // -------------------------------------------------------------------------
+  const waitForCooldown = () => new Promise((resolve) => setTimeout(resolve, 120));
+  await waitForCooldown();
+
+  const failover500 = await post("/v1/messages", {
+    model: "test-failover-500",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(failover500.status, 200);
+  assert.equal(failover500.headers.get("x-proxy-upstream"), "secondary");
+  assert.match(await failover500.text(), /SECONDARY/);
+
+  const healthWhileCooling = await (await fetch(`http://127.0.0.1:${healthPort}/health`)).json();
+  assert.equal(healthWhileCooling.upstreams[0].cooling, true);
+  assert.ok(healthWhileCooling.upstreams[0].cool_until > Date.now());
+  assert.ok(healthWhileCooling.upstreams[0].failovers >= 1);
+  assert.ok(healthWhileCooling.stats.failovers >= 1);
+
+  const primaryBeforeCooldownSkip = captured.length;
+  const cooldownSkip = await post("/v1/messages", {
+    model: "claude-opus-4-8",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(cooldownSkip.headers.get("x-proxy-upstream"), "secondary");
+  assert.equal(captured.length, primaryBeforeCooldownSkip, "a cooling primary was retried");
+
+  await waitForCooldown();
+  const expiredCooldown4xx = await post("/v1/messages", {
+    model: "test-no-failover-429",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(expiredCooldown4xx.status, 429);
+  const healthAfter4xx = await (await fetch(`http://127.0.0.1:${healthPort}/health`)).json();
+  assert.equal(healthAfter4xx.upstreams[0].cooling, false);
+  assert.equal(typeof healthAfter4xx.upstreams[0].cool_until, "number", "a delivered 4xx cleared cooldown state");
+
+  const primaryBeforeExpiry = captured.length;
+  const cooldownExpired = await post("/v1/messages", {
+    model: "claude-opus-4-8",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(cooldownExpired.headers.get("x-proxy-upstream"), "primary");
+  assert.equal(captured.length, primaryBeforeExpiry + 1);
+  const healthAfterSuccess = await (await fetch(`http://127.0.0.1:${healthPort}/health`)).json();
+  assert.equal(healthAfterSuccess.upstreams[0].cool_until, null);
+
+  await post("/v1/messages", {
+    model: "test-failover-500",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  await waitForCooldown();
+  const primaryBeforeConcurrentExpiry = captured.length;
+  const concurrentExpiry = await Promise.all(Array.from({ length: 4 }, () => post("/v1/messages", {
+    model: "claude-opus-4-8",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  })));
+  assert.ok(concurrentExpiry.every((response) => response.headers.get("x-proxy-upstream") === "primary"));
+  assert.equal(captured.length, primaryBeforeConcurrentExpiry + 4);
+
+  for (const [model, expectedStatus] of [["test-no-failover-429", 429], ["test-no-failover-400", 400], ["test-rate", 429]]) {
+    const backupBefore = secondaryCaptured.length + thirdCaptured.length;
+    const response = await post("/v1/messages", {
+      model,
+      max_tokens: 8,
+      messages: [{ role: "user", content: "x" }]
+    });
+    assert.equal(response.status, expectedStatus);
+    assert.equal(response.headers.get("x-proxy-upstream"), "primary");
+    assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBefore, `${model} incorrectly failed over`);
+  }
+
+  for (const [model, stream] of [["test-failover-before-first", true], ["test-failover-empty-stream", true], ["test-failover-empty-complete", false], ["test-failover-sse-503", true]]) {
+    await waitForCooldown();
+    const response = await post("/v1/messages", {
+      model,
+      max_tokens: 8,
+      stream,
+      messages: [{ role: "user", content: "x" }]
+    });
+    assert.equal(response.status, 200, `${model} did not fail over`);
+    assert.equal(response.headers.get("x-proxy-upstream"), "secondary");
+    assert.match(await response.text(), /SECONDARY/);
+  }
+
+  await waitForCooldown();
+  const backupBeforeSse429 = secondaryCaptured.length + thirdCaptured.length;
+  const sse429 = await post("/v1/messages", {
+    model: "test-no-failover-sse-429",
+    max_tokens: 8,
+    stream: true,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(sse429.status, 429);
+  assert.equal(sse429.headers.get("x-proxy-upstream"), "primary");
+  assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBeforeSse429);
+
+  await waitForCooldown();
+  const backupBeforePartial = secondaryCaptured.length + thirdCaptured.length;
+  const partial = await post("/v1/messages", {
+    model: "test-failover-after-first",
+    max_tokens: 8,
+    stream: true,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(partial.status, 200);
+  assert.equal(partial.headers.get("x-proxy-upstream"), "primary");
+  await assert.rejects(partial.text());
+  assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBeforePartial, "a committed stream failed over");
+
+  for (const [path, payload] of [
+    ["/v1/chat/completions", { model: "test-failover-chat", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/responses", { model: "test-failover-responses", input: "x", stream: true }]
+  ]) {
+    await waitForCooldown();
+    const response = await post(path, payload);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-proxy-upstream"), "secondary");
+  }
+
+  for (const [path, payload] of [
+    ["/v1/chat/completions", { model: "test-failover-empty-stream", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/chat/completions", { model: "test-failover-sse-503", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/responses", { model: "test-failover-empty-stream", input: "x", stream: true }],
+    ["/v1/responses", { model: "test-failover-sse-503", input: "x", stream: true }]
+  ]) {
+    await waitForCooldown();
+    const response = await post(path, payload);
+    assert.equal(response.status, 200, `${path} ${payload.model} did not fail over`);
+    assert.equal(response.headers.get("x-proxy-upstream"), "secondary");
+  }
+
+  for (const [path, payload] of [
+    ["/v1/chat/completions", { model: "test-no-failover-sse-429", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/responses", { model: "test-no-failover-sse-429", input: "x", stream: true }]
+  ]) {
+    await waitForCooldown();
+    const backupBefore = secondaryCaptured.length + thirdCaptured.length;
+    const response = await post(path, payload);
+    assert.equal(response.status, 429, `${path} sse 429 status`);
+    assert.equal(response.headers.get("x-proxy-upstream"), "primary");
+    assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBefore, `${path} sse 429 incorrectly failed over`);
+  }
+
+  for (const [path, payload] of [
+    ["/v1/chat/completions", { model: "test-failover-after-first", stream: true, messages: [{ role: "user", content: "x" }] }],
+    ["/v1/responses", { model: "test-failover-after-first", input: "x", stream: true }]
+  ]) {
+    await waitForCooldown();
+    const backupBefore = secondaryCaptured.length + thirdCaptured.length;
+    const response = await post(path, payload);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-proxy-upstream"), "primary");
+    await assert.rejects(response.text());
+    assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBefore, `${path} committed stream failed over`);
+  }
+
+  await waitForCooldown();
+  const modelsFailover = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?failprimary=1`, { headers: { authorization: `Bearer ${localKey}` } });
+  assert.equal(modelsFailover.status, 200);
+  assert.equal(modelsFailover.headers.get("x-proxy-upstream"), "secondary");
+  assert.equal((await modelsFailover.json()).served_by, "secondary");
+
+  await waitForCooldown();
+  const allDown = await post("/v1/chat/completions", {
+    model: "test-all-down",
+    stream: false,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(allDown.status, 500);
+  assert.equal(allDown.headers.get("x-proxy-upstream"), "third");
+  assert.equal((await allDown.json()).error.type, "api_error");
+
+  await waitForCooldown();
+  const allDownMessages = await post("/v1/messages", {
+    model: "test-all-down",
+    stream: false,
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(allDownMessages.status, 500);
+  assert.equal(allDownMessages.headers.get("x-proxy-upstream"), "third");
+
+  await waitForCooldown();
+  const allDownModels = await fetch(`http://127.0.0.1:${proxyPort}/v1/models?failall=1`, { headers: { authorization: `Bearer ${localKey}` } });
+  assert.equal(allDownModels.status, 500);
+  assert.equal(allDownModels.headers.get("x-proxy-upstream"), "third");
+
+  // Last-upstream cooling lets the all-cooling fallback retry the primary
+  // immediately instead of pinning traffic to a dead final gateway.
+  const pinRecovery = await post("/v1/messages", {
+    model: "claude-opus-4-8",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(pinRecovery.status, 200);
+  assert.equal(pinRecovery.headers.get("x-proxy-upstream"), "primary");
+
+  await waitForCooldown();
+  const secondaryBeforeDestroyedResponse = secondaryCaptured.length;
+  const destroyedResponse = await post("/v1/messages", {
+    model: "test-destroy-prior",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "x" }]
+  });
+  assert.equal(destroyedResponse.headers.get("x-proxy-upstream"), "secondary");
+  await failedResponseDestroyed;
+  assert.equal(secondaryCaptured.length, secondaryBeforeDestroyedResponse + 1, "backup started before the failed response was destroyed");
+  assert.deepEqual(lifecycleEvents, ["primary-response-destroyed", "secondary-request-started"]);
+
+  await waitForCooldown();
+  upstream.closeAllConnections();
+  await new Promise((resolve) => upstream.close(resolve));
+  try {
+    const refused = await post("/v1/messages", {
+      model: "claude-opus-4-8",
+      max_tokens: 8,
+      messages: [{ role: "user", content: "x" }]
+    });
+    assert.equal(refused.status, 200);
+    assert.equal(refused.headers.get("x-proxy-upstream"), "secondary");
+  } finally {
+    await new Promise((resolve, reject) => {
+      upstream.once("error", reject);
+      upstream.listen(upstreamPort, "127.0.0.1", () => {
+        upstream.off("error", reject);
+        resolve();
+      });
+    });
+  }
+
+  await waitForCooldown();
+  const backupBeforeAbort = secondaryCaptured.length + thirdCaptured.length;
+  const abortRequest = http.request({
+    hostname: "127.0.0.1",
+    port: proxyPort,
+    path: "/v1/messages",
+    method: "POST",
+    headers: { ...authHeaders, host: `127.0.0.1:${proxyPort}` }
+  });
+  abortRequest.on("error", () => {});
+  abortRequest.end(JSON.stringify({
+    model: "test-client-abort",
+    max_tokens: 8,
+    stream: true,
+    messages: [{ role: "user", content: "x" }]
+  }));
+  await clientAbortStarted;
+  abortRequest.destroy();
+  await clientAbortClosed;
+  assert.equal(secondaryCaptured.length + thirdCaptured.length, backupBeforeAbort, "a client abort triggered failover");
+
+  await waitForCooldown();
+
+  // -------------------------------------------------------------------------
   // Health moved off the public port onto its own loopback-only listener.
   // -------------------------------------------------------------------------
 
@@ -1131,11 +1612,16 @@ try {
   const healthResponse = await fetch(`http://127.0.0.1:${healthPort}/health`);
   const health = await healthResponse.json();
   assert.equal(healthResponse.status, 200);
-  assert.deepEqual(Object.keys(health).sort(), ["node", "ok", "stats", "upstream", "uptime_seconds", "version"]);
+  assert.deepEqual(Object.keys(health).sort(), ["node", "ok", "stats", "upstreams", "uptime_seconds", "version"]);
   assert.equal(health.ok, true);
-  assert.equal(health.version, "4.1.0");
+  assert.equal(health.version, "5.0.0");
   assert.equal(health.node, process.version);
-  assert.equal(health.upstream, `http://127.0.0.1:${upstreamPort}`);
+  assert.deepEqual(health.upstreams.map(({ name, origin }) => ({ name, origin })), [
+    { name: "primary", origin: `http://127.0.0.1:${upstreamPort}` },
+    { name: "secondary", origin: `http://127.0.0.1:${secondaryPort}` },
+    { name: "third", origin: `http://127.0.0.1:${thirdPort}` }
+  ]);
+  assert.ok(health.upstreams.every((entry) => !Object.hasOwn(entry, "api_key")));
   assert.ok(health.stats.normalizedTo429 >= 2);
   assert.ok(health.stats.droppedSseFrames >= 5);
   assert.ok(health.stats.emptyStreamsRecovered >= 1);
@@ -1222,15 +1708,19 @@ try {
 
   // The markers prove redaction actually ran on both legs. Without them, the
   // absence assertions below would also pass on an empty or truncated file.
-  assert.ok(traceText.includes("[REDACTED:UPSTREAM_API_KEY]"), "upstream key was never redacted in the trace");
+  for (const name of ["primary", "secondary", "third"]) {
+    assert.ok(traceText.includes(`[REDACTED:UPSTREAM:${name}]`), `${name} key was never redacted in the trace`);
+  }
   assert.ok(traceText.includes("[REDACTED:LOCAL_PROXY_KEY]"), "local key was never redacted in the trace");
 
   // Not one character of either secret survives. A marker that kept even a short
   // prefix -- the usual "sk-abc…" courtesy -- would hand anyone who can read this
   // file a head start on the key it is there to protect.
-  for (const [name, secret] of [["UPSTREAM_API_KEY", testApiKey], ["LOCAL_PROXY_KEY", localKey]]) {
+  for (const [name, secret] of [["primary api_key", testApiKey], ["secondary api_key", secondaryApiKey], ["third api_key", thirdApiKey], ["LOCAL_PROXY_KEY", localKey]]) {
     assert.ok(!traceText.includes(secret), `${name} appears verbatim in the trace`);
     assert.ok(!traceText.includes(secret.slice(0, 6)), `a prefix of ${name} appears in the trace`);
+    assert.ok(!stdout.includes(secret), `${name} appears verbatim in stdout`);
+    assert.ok(!stderr.includes(secret), `${name} appears verbatim in stderr`);
   }
 
   // -------------------------------------------------------------------------
@@ -1243,7 +1733,7 @@ try {
   assert.notEqual(missingVars.code, 0);
   assert.match(missingVars.stderr, /LOCAL_PROXY_KEY/);
   assert.match(missingVars.stderr, /UPSTREAM_TIMEOUT_MS/);
-  assert.match(missingVars.stderr, /2 environment variable problems/);
+  assert.match(missingVars.stderr, /2 configuration problems/);
   assert.equal(missingVars.stdout, "");
 
   // The two variables the guard and the health listener need are required like
@@ -1253,7 +1743,7 @@ try {
   assert.notEqual(missingGuardVars.code, 0);
   assert.match(missingGuardVars.stderr, /ALLOWED_HOSTS/);
   assert.match(missingGuardVars.stderr, /HEALTH_PORT/);
-  assert.match(missingGuardVars.stderr, /2 environment variable problems/);
+  assert.match(missingGuardVars.stderr, /2 configuration problems/);
 
   // Comparisons between variables may only run once both sides have actually
   // parsed. With PORT and HEALTH_PORT both unset the report must be exactly the
@@ -1263,7 +1753,7 @@ try {
   // instead of reading the two real problems above it.
   const bothPortsMissing = await runProxyToExit(envWithout("PORT", "HEALTH_PORT"));
   assert.notEqual(bothPortsMissing.code, 0);
-  assert.match(bothPortsMissing.stderr, /2 environment variable problems/);
+  assert.match(bothPortsMissing.stderr, /2 configuration problems/);
   assert.doesNotMatch(bothPortsMissing.stderr, /a port of its own/);
 
   // Health needs a port of its own; sharing PORT would put the counters and the
@@ -1271,7 +1761,7 @@ try {
   const clashingPorts = await runProxyToExit(envWith({ HEALTH_PORT: proxyEnv.PORT }));
   assert.notEqual(clashingPorts.code, 0);
   assert.match(clashingPorts.stderr, /HEALTH_PORT: expected a port of its own/);
-  assert.match(clashingPorts.stderr, /1 environment variable problem\./);
+  assert.match(clashingPorts.stderr, /1 configuration problem\./);
 
   // The local key is the only thing between the open internet and a paid
   // upstream credential, so it has to be generated rather than chosen. A short
@@ -1281,25 +1771,90 @@ try {
   assert.notEqual(shortLocalKey.code, 0);
   assert.match(shortLocalKey.stderr, /LOCAL_PROXY_KEY: expected at least 32 characters/);
   assert.match(shortLocalKey.stderr, /openssl rand -base64 32/);
-  assert.match(shortLocalKey.stderr, /1 environment variable problem\./);
+  assert.match(shortLocalKey.stderr, /1 configuration problem\./);
   assert.doesNotMatch(shortLocalKey.stderr, /sk-dummy/);
 
   // Reusing the upstream credential as the client-facing key would hand it to
   // every client that connects, which is the one outcome the split prevents.
   const reusedKey = await runProxyToExit(envWith({ LOCAL_PROXY_KEY: testApiKey }));
   assert.notEqual(reusedKey.code, 0);
-  assert.match(reusedKey.stderr, /LOCAL_PROXY_KEY: expected a secret of its own/);
-  assert.match(reusedKey.stderr, /same value as UPSTREAM_API_KEY/);
-  assert.match(reusedKey.stderr, /1 environment variable problem\./);
+  assert.match(reusedKey.stderr, /UPSTREAMS_FILE\[0\]\.api_key: expected a secret different from LOCAL_PROXY_KEY/);
+  assert.match(reusedKey.stderr, /1 configuration problem\./);
   assert.ok(!reusedKey.stderr.includes(testApiKey.slice(0, 6)), "the rejected key leaked into stderr");
+
+  const missingUpstreams = await runProxyToExit(envWith({ UPSTREAMS_FILE: join(tmpdir(), `proxy-test-missing-${process.pid}.json`) }));
+  assert.notEqual(missingUpstreams.code, 0);
+  assert.match(missingUpstreams.stderr, /UPSTREAMS_FILE: expected a readable regular JSON file/);
+
+  const upstreamDirectory = fs.mkdtempSync(join(tmpdir(), `proxy-test-upstreams-dir-${process.pid}-`));
+  validationPaths.push(upstreamDirectory);
+  const directoryUpstreams = await runProxyToExit(envWith({ UPSTREAMS_FILE: upstreamDirectory }));
+  assert.notEqual(directoryUpstreams.code, 0);
+  assert.match(directoryUpstreams.stderr, /is not a regular file/);
+
+  const malformedUpstreams = await runProxyToExit(envWithUpstreams("{broken"));
+  assert.notEqual(malformedUpstreams.code, 0);
+  assert.match(malformedUpstreams.stderr, /expected valid JSON/);
+
+  const emptyUpstreams = await runProxyToExit(envWithUpstreams([]));
+  assert.notEqual(emptyUpstreams.code, 0);
+  assert.match(emptyUpstreams.stderr, /expected a non-empty JSON array/);
+
+  const duplicateName = await runProxyToExit(envWithUpstreams([
+    { name: "same", base_url: "https://one.example", api_key: "DuplicateKeyOne" },
+    { name: "same", base_url: "https://two.example", api_key: "DuplicateKeyTwo" }
+  ]));
+  assert.notEqual(duplicateName.code, 0);
+  assert.match(duplicateName.stderr, /expected a unique name/);
+
+  const badBaseUrl = await runProxyToExit(envWithUpstreams([
+    { name: "bad-url", base_url: "ftp://gateway.example", api_key: "ValidKeyForBadUrl" }
+  ]));
+  assert.notEqual(badBaseUrl.code, 0);
+  assert.match(badBaseUrl.stderr, /UPSTREAMS_FILE\[0\]\.base_url: expected an absolute http:\/\/ or https:\/\/ URL/);
 
   // The upstream key has a floor of its own, low enough for the short keys some
   // gateways issue but high enough to catch a truncated paste.
-  const shortUpstreamKey = await runProxyToExit(envWith({ UPSTREAM_API_KEY: "Ry3tiny" }));
+  const shortSecret = "Ry3tiny";
+  const shortUpstreamKey = await runProxyToExit(envWithUpstreams([
+    { name: "short-key", base_url: "https://gateway.example", api_key: shortSecret }
+  ]));
   assert.notEqual(shortUpstreamKey.code, 0);
-  assert.match(shortUpstreamKey.stderr, /UPSTREAM_API_KEY: expected at least 8 characters/);
-  assert.match(shortUpstreamKey.stderr, /1 environment variable problem\./);
-  assert.doesNotMatch(shortUpstreamKey.stderr, /Ry3tiny/);
+  assert.match(shortUpstreamKey.stderr, /UPSTREAMS_FILE\[0\]\.api_key: expected at least 8 printable ASCII characters/);
+  assert.match(shortUpstreamKey.stderr, /1 configuration problem\./);
+  assert.doesNotMatch(shortUpstreamKey.stderr, new RegExp(shortSecret));
+
+  const nonObjectEntrySecret = "NonObjectEntrySecret99";
+  const nonObjectEntry = await runProxyToExit(envWithUpstreams([null]));
+  assert.notEqual(nonObjectEntry.code, 0);
+  assert.match(nonObjectEntry.stderr, /UPSTREAMS_FILE\[0\]: expected an object with exactly name, base_url and api_key/);
+  assert.doesNotMatch(nonObjectEntry.stderr, new RegExp(nonObjectEntrySecret));
+
+  const extraKeySecret = "ExtraKeySecretValue88";
+  const extraKey = await runProxyToExit(envWithUpstreams([
+    { name: "extra", base_url: "https://gateway.example", api_key: extraKeySecret, region: "us" }
+  ]));
+  assert.notEqual(extraKey.code, 0);
+  assert.match(extraKey.stderr, /UPSTREAMS_FILE\[0\]: expected exactly the keys name, base_url and api_key/);
+  assert.doesNotMatch(extraKey.stderr, new RegExp(extraKeySecret));
+
+  const missingKey = await runProxyToExit(envWithUpstreams([
+    { name: "missing", base_url: "https://gateway.example" }
+  ]));
+  assert.notEqual(missingKey.code, 0);
+  assert.match(missingKey.stderr, /UPSTREAMS_FILE\[0\]: expected exactly the keys name, base_url and api_key/);
+
+  const emptyName = await runProxyToExit(envWithUpstreams([
+    { name: "   ", base_url: "https://gateway.example", api_key: "ValidKeyForEmptyName" }
+  ]));
+  assert.notEqual(emptyName.code, 0);
+  assert.match(emptyName.stderr, /UPSTREAMS_FILE\[0\]\.name: expected a non-empty printable ASCII name/);
+
+  const nonAsciiName = await runProxyToExit(envWithUpstreams([
+    { name: "主要", base_url: "https://gateway.example", api_key: "ValidKeyForNonAscii" }
+  ]));
+  assert.notEqual(nonAsciiName.code, 0);
+  assert.match(nonAsciiName.stderr, /UPSTREAMS_FILE\[0\]\.name: expected a non-empty printable ASCII name/);
 
   // Present but unusable fails the same way, and a rejected secret is never
   // echoed back into stderr -- stderr ends up in container logs. This value is
@@ -1319,8 +1874,13 @@ try {
   // Exactly the three variables this case broke, and no fourth: what is reported
   // has to be the injected failures themselves, not a knock-on problem derived
   // from one of them.
-  assert.match(invalidVars.stderr, /3 environment variable problems/);
+  assert.match(invalidVars.stderr, /3 configuration problems/);
   assert.doesNotMatch(invalidVars.stderr, /leaky/);
+
+  const validationOutput = validationOutputs.map(({ stdout: childStdout, stderr: childStderr }) => `${childStdout}\n${childStderr}`).join("\n");
+  for (const secret of [testApiKey, secondaryApiKey, thirdApiKey, "DuplicateKeyOne", "DuplicateKeyTwo", "ValidKeyForBadUrl", shortSecret]) {
+    assert.ok(!validationOutput.includes(secret), `api_key ${secret.slice(0, 4)}... leaked during validation`);
+  }
 
   console.log(`All Local API Proxy v${health.version} tests passed (${captured.length} upstream requests).`);
 } finally {
@@ -1329,5 +1889,11 @@ try {
   }
   proxy.kill("SIGTERM");
   upstream.close();
+  secondary.close();
+  third.close();
   try { fs.rmSync(traceFilePath, { force: true }); } catch {}
+  try { fs.rmSync(upstreamsFilePath, { force: true }); } catch {}
+  for (const validationPath of validationPaths) {
+    try { fs.rmSync(validationPath, { force: true, recursive: true }); } catch {}
+  }
 }
