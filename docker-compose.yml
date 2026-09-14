@@ -70,6 +70,7 @@ services:
       UPSTREAM_API_KEY: "${UPSTREAM_API_KEY:?missing in .env - see .env.example}"
       LOCAL_PROXY_KEY: "${LOCAL_PROXY_KEY:?missing in .env - see .env.example}"
       CLAUDE_CODE_VERSION: "${CLAUDE_CODE_VERSION:?missing in .env - see .env.example}"
+      OVERRIDE_UPSTREAM_USER_AGENT: "${OVERRIDE_UPSTREAM_USER_AGENT:?missing in .env - see .env.example}"
       UPSTREAM_MODEL: "${UPSTREAM_MODEL:?missing in .env - see .env.example}"
       UPSTREAM_TIMEOUT_MS: "${UPSTREAM_TIMEOUT_MS:?missing in .env - see .env.example}"
       RETRY_AFTER_SECONDS: "${RETRY_AFTER_SECONDS:?missing in .env - see .env.example}"

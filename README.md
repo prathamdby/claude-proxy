@@ -133,6 +133,7 @@ Do not quote them — Compose treats quotes in an env file as part of the value.
 | `UPSTREAM_API_KEY` | Gateway credential, sent as `Authorization: Bearer`. Bills to your account. | ≥8 chars |
 | `LOCAL_PROXY_KEY` | Secret Claude Code must present to this proxy. The only gate in front of `UPSTREAM_API_KEY`. | ≥32 chars, from `openssl rand -base64 32` |
 | `CLAUDE_CODE_VERSION` | Version in the synthesized `User-Agent`, used only when the caller sends none. | `2.1.197` |
+| `OVERRIDE_UPSTREAM_USER_AGENT` | When true, replace the upstream `User-Agent` with a hardcoded first-party CLI identity for the path dialect. Anthropic paths send Claude Code `claude-cli/2.1.270 (external, cli)`. OpenAI paths send Codex `codex_cli_rs/0.154.0 (Linux 6.12.0; x86_64) unknown`. The strings are not env-configurable. When false, keep current forwarding and bare-client defaults. | `true` / `false` |
 | `UPSTREAM_MODEL` | Model used when a request omits `model`. | `claude-opus-4-8` |
 | `UPSTREAM_TIMEOUT_MS` | Socket timeout per upstream request. Server timeout is this +30000. | `300000` (≥1) |
 | `RETRY_AFTER_SECONDS` | `Retry-After` on 429/5xx when upstream sends none. | `15` (≥1) |
@@ -144,7 +145,7 @@ Do not quote them — Compose treats quotes in an env file as part of the value.
 | `PROXY_TRACE` | File tracing. See [Privacy](#privacy). | `true` / `false` |
 | `PROXY_TRACE_BODY_LIMIT` | Characters traced before truncation. `0` means **no** truncation. | `4000` (≥0) |
 
-The three boolean flags accept **exactly** `true` or `false`. Not `1`, not `0`,
+The boolean flags accept **exactly** `true` or `false`. Not `1`, not `0`,
 not `yes`, not `on`. Anything else stops startup rather than being guessed at.
 
 Note the trap in the last row: `PROXY_LOG_BODY_LIMIT=0` truncates every logged
