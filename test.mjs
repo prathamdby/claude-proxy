@@ -426,13 +426,15 @@ function envWith(overrides) {
   return { ...proxyEnv, ...overrides };
 }
 
-async function reservePort() {
-  const server = http.createServer();
-  const port = await listen(server);
-  await new Promise((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  });
-  return port;
+async function reserveDistinctPorts() {
+  const first = http.createServer();
+  const second = http.createServer();
+  const firstPort = await listen(first);
+  const secondPort = await listen(second);
+  first.close();
+  second.close();
+  await Promise.all([once(first, "close"), once(second, "close")]);
+  return [firstPort, secondPort];
 }
 
 async function startProxy(env) {
@@ -1232,8 +1234,7 @@ try {
   // OVERRIDE_UPSTREAM_USER_AGENT=false is already the suite default: the two
   // User-Agent checks above are the off path. The on path needs its own process
   // because the flag is read once at startup.
-  const overridePort = await reservePort();
-  const overrideHealthPort = await reservePort();
+  const [overridePort, overrideHealthPort] = await reserveDistinctPorts();
   overrideProxy = await startProxy(envWith({
     PORT: String(overridePort),
     HEALTH_PORT: String(overrideHealthPort),
