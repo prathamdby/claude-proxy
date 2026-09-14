@@ -135,6 +135,7 @@ const config = (() => {
     { minLength: 32, secret: true, pattern: headerValue }
   );
   readText("CLAUDE_CODE_VERSION", "a version string such as 2.1.197", { pattern: headerValue });
+  readBoolean("OVERRIDE_UPSTREAM_USER_AGENT", "replace the upstream User-Agent with the first-party CLI identity for the path dialect");
   readText("UPSTREAM_MODEL", "a model id such as claude-opus-4-8");
   readInteger("UPSTREAM_TIMEOUT_MS", `an integer between 1 and ${maxTimeoutMs} (milliseconds)`, { min: 1, max: maxTimeoutMs });
   readInteger("RETRY_AFTER_SECONDS", "an integer of at least 1 (seconds)", { min: 1 });
@@ -190,6 +191,7 @@ const upstreamBaseUrl = config.UPSTREAM_BASE_URL;
 const apiKey = config.UPSTREAM_API_KEY;
 const localProxyKey = config.LOCAL_PROXY_KEY;
 const claudeCodeVersion = config.CLAUDE_CODE_VERSION;
+const overrideUpstreamUserAgent = config.OVERRIDE_UPSTREAM_USER_AGENT;
 const defaultModel = config.UPSTREAM_MODEL;
 const upstreamTimeoutMs = config.UPSTREAM_TIMEOUT_MS;
 const retryAfterSeconds = config.RETRY_AFTER_SECONDS;
@@ -574,6 +576,15 @@ const bareClientDefaults = {
   "content-type": "application/json"
 };
 
+// Hardcoded first-party CLI identities. The toggle only chooses whether these
+// replace the caller's User-Agent; the strings are not env-configurable.
+// Claude Code format: anthropics/claude-code#72879. Version: npm 2.1.270.
+// Codex formula: openai/codex get_codex_user_agent. Version: rust-v0.154.0.
+const overrideUpstreamUserAgentByDialect = Object.freeze({
+  anthropic: "claude-cli/2.1.270 (external, cli)",
+  openai: "codex_cli_rs/0.154.0 (Linux 6.12.0; x86_64) unknown"
+});
+
 function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
   const headers = {};
   const omit = new Set(requestHeadersProxyOwns);
@@ -591,6 +602,10 @@ function safeUpstreamHeaders(sourceHeaders, bodyLength, wantsStream, dialect) {
 
   for (const [name, value] of Object.entries(bareClientDefaults)) {
     if (headers[name] === undefined) headers[name] = value;
+  }
+
+  if (overrideUpstreamUserAgent) {
+    headers["user-agent"] = overrideUpstreamUserAgentByDialect[dialect.name];
   }
 
   headers["x-claude-code-session-id"] = sessionId(sourceHeaders);

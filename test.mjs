@@ -293,6 +293,7 @@ const proxyEnv = {
   UPSTREAM_API_KEY: testApiKey,
   LOCAL_PROXY_KEY: localKey,
   CLAUDE_CODE_VERSION: "0.0.0-test",
+  OVERRIDE_UPSTREAM_USER_AGENT: "false",
   UPSTREAM_MODEL: "claude-opus-4-8",
   UPSTREAM_TIMEOUT_MS: "300000",
   RETRY_AFTER_SECONDS: "11",
@@ -424,6 +425,42 @@ function envWithout(...names) {
 function envWith(overrides) {
   return { ...proxyEnv, ...overrides };
 }
+
+async function reserveDistinctPorts() {
+  const first = http.createServer();
+  const second = http.createServer();
+  const firstPort = await listen(first);
+  const secondPort = await listen(second);
+  first.close();
+  second.close();
+  await Promise.all([once(first, "close"), once(second, "close")]);
+  return [firstPort, secondPort];
+}
+
+async function startProxy(env) {
+  const child = spawn(process.execPath, ["proxy.mjs"], {
+    cwd: new URL(".", import.meta.url),
+    env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let childStderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { childStderr += chunk; });
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${env.HEALTH_PORT}/health`);
+      if (response.ok) return child;
+    } catch {}
+    if (child.exitCode !== null) {
+      throw new Error(`proxy exited during start: ${childStderr}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  child.kill("SIGTERM");
+  throw new Error(`proxy did not start: ${childStderr}`);
+}
+
+let overrideProxy;
 
 try {
   await waitForProxy();
@@ -1194,6 +1231,64 @@ try {
   assert.equal(bare.headers["content-type"], "application/json");
   assert.equal(bare.headers["x-stainless-os"], undefined);
 
+  // OVERRIDE_UPSTREAM_USER_AGENT=false is already the suite default: the two
+  // User-Agent checks above are the off path. The on path needs its own process
+  // because the flag is read once at startup.
+  const [overridePort, overrideHealthPort] = await reserveDistinctPorts();
+  overrideProxy = await startProxy(envWith({
+    PORT: String(overridePort),
+    HEALTH_PORT: String(overrideHealthPort),
+    OVERRIDE_UPSTREAM_USER_AGENT: "true",
+    PROXY_LOG: "false",
+    PROXY_TRACE: "false"
+  }));
+
+  const overrideClaudeIndex = captured.length;
+  const overrideClaudeResponse = await fetch(`http://127.0.0.1:${overridePort}/v1/messages`, {
+    method: "POST",
+    headers: {
+      ...authHeaders,
+      "user-agent": "curl/8.0.0",
+      "x-custom-client-header": "must-not-block-override"
+    },
+    body: JSON.stringify({
+      model: "claude-opus-4-8",
+      max_tokens: 8,
+      messages: [{ role: "user", content: "hi" }]
+    })
+  });
+  assert.equal(overrideClaudeResponse.status, 200, `override Anthropic got ${overrideClaudeResponse.status}`);
+  const overrideClaude = captured[overrideClaudeIndex];
+  assert.equal(overrideClaude.headers["user-agent"], "claude-cli/2.1.270 (external, cli)");
+  assert.equal(overrideClaude.headers["x-custom-client-header"], "must-not-block-override");
+
+  const overrideOpenAiIndex = captured.length;
+  const overrideOpenAiResponse = await fetch(`http://127.0.0.1:${overridePort}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      ...authHeaders,
+      "user-agent": "claude-cli/2.1.233 (external, cli)"
+    },
+    body: JSON.stringify({
+      model: "glm-5.2",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }]
+    })
+  });
+  assert.equal(overrideOpenAiResponse.status, 200, `override OpenAI got ${overrideOpenAiResponse.status}`);
+  const overrideOpenAi = captured[overrideOpenAiIndex];
+  assert.equal(overrideOpenAi.headers["user-agent"], "codex_cli_rs/0.154.0 (Linux 6.12.0; x86_64) unknown");
+
+  const overrideBareResponse = await rawRequest({
+    method: "POST",
+    path: "/v1/messages",
+    port: overridePort,
+    headers: { authorization: `Bearer ${localKey}` },
+    body: { model: "claude-opus-4-8", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }
+  });
+  assert.equal(overrideBareResponse.status, 200, `override bare client got ${overrideBareResponse.status}: ${overrideBareResponse.text}`);
+  assert.equal(captured.at(-1).headers["user-agent"], "claude-cli/2.1.270 (external, cli)");
+
   assert.equal(first.headers["x-claude-code-session-id"], preservedSession);
   assert.ok(first.headers["anthropic-beta"].includes("claude-code-20250219"));
   assert.ok(first.headers["anthropic-beta"].includes("context-1m-2025-08-07"));
@@ -1307,6 +1402,16 @@ try {
   // carries a newline: a control character is refused on its own, since the
   // value ends up in an HTTP header. Keeping it above the floor is what makes
   // the control-character rule the thing under test here rather than the length.
+  const missingOverrideVars = await runProxyToExit(envWithout("OVERRIDE_UPSTREAM_USER_AGENT"));
+  assert.notEqual(missingOverrideVars.code, 0);
+  assert.match(missingOverrideVars.stderr, /OVERRIDE_UPSTREAM_USER_AGENT/);
+  assert.match(missingOverrideVars.stderr, /1 environment variable problem\./);
+
+  const invalidOverrideFlag = await runProxyToExit(envWith({ OVERRIDE_UPSTREAM_USER_AGENT: "yes" }));
+  assert.notEqual(invalidOverrideFlag.code, 0);
+  assert.match(invalidOverrideFlag.stderr, /OVERRIDE_UPSTREAM_USER_AGENT: expected exactly "true" or "false"/);
+  assert.match(invalidOverrideFlag.stderr, /1 environment variable problem\./);
+
   const invalidVars = await runProxyToExit(envWith({
     PORT: "abc",
     PROXY_TRACE: "1",
@@ -1328,6 +1433,7 @@ try {
     try { lingering.end(); } catch {}
   }
   proxy.kill("SIGTERM");
+  if (overrideProxy) overrideProxy.kill("SIGTERM");
   upstream.close();
   try { fs.rmSync(traceFilePath, { force: true }); } catch {}
 }
